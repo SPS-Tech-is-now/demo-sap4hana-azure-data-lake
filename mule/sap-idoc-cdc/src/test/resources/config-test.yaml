@@ -1,0 +1,22 @@
+# sap-idoc-cdc — configuración entorno DEV (Artes Gráficas)
+sap:
+  systemId: "ECC_PRD"
+  host: "sapecc.artesgraficas.local"
+  systemNumber: "00"
+  client: "300"
+  gateway:
+    host: "sapecc.artesgraficas.local"
+    service: "sapgw00"
+  programId: "MULE_CDC_MAESTROS"            # registrar en SM59 (destino TCP/IP) y puerto RFC en WE21
+  connectionCount: "2"
+  idocTypeFilterRegex: "(DEBMAS|CREMAS|MATMAS).*"
+
+amq:
+  url: "https://mq-us-east-1.anypoint.mulesoft.com/api/v1"
+  queue:
+    audit:    "cdc.audit"
+    maestros: "cdc.q.maestros"
+
+retry:
+  maxRetries: "3"
+  millisBetweenRetries: "2000"

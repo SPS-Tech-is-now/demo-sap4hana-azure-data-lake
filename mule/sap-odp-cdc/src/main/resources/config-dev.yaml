@@ -1,0 +1,24 @@
+# sap-odp-cdc — configuración entorno DEV (Artes Gráficas)
+sap:
+  systemId: "ECC_PRD"
+  client: "300"
+  gateway:
+    baseUrl: "https://sapgw.artesgraficas.local:44300/sap/opu/odata/sap"
+    pageSize: "1000"
+    maxPages: "20000"          # tope de seguridad del bucle de paginación
+    responseTimeoutMs: "120000"
+
+schedule:
+  ventasMs: "300000"      # 5 min  — ventas, compras y producción
+  finanzasMs: "900000"    # 15 min — finanzas, costos e inventario
+
+amq:
+  url: "https://mq-us-east-1.anypoint.mulesoft.com/api/v1"
+  queue:
+    audit:    "cdc.audit"
+    ventas:   "cdc.q.ventas"
+    finanzas: "cdc.q.finanzas"
+
+retry:
+  maxRetries: "5"
+  millisBetweenRetries: "3000"

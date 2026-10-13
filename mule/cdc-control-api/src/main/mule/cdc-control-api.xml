@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cdc-control-api — Experience API de operación del CDC (Artes Gráficas)
+
+  · /trace/{correlationId}  : recorrido de un cambio en la auditoría (CDC_AUDIT).
+  · /health/lag             : rezago por tabla vs. SLA del dominio.
+  · /reconcile              : capturado (eventos PUBLISHED) vs. aterrizado (manifiestos ADLS).
+  · /resync                 : comando de recarga acotada (op = R) que ejecuta sap-initial-load.
+  · /dlq/replay             : nivel 4 de reintento — replay controlado de la DLQ.
+  · audit-ingest-flow       : persiste los eventos de cdc.audit en Azure SQL.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:azure-data-lake-storage="http://www.mulesoft.org/schema/mule/azure-data-lake-storage"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/azure-data-lake-storage http://www.mulesoft.org/schema/mule/azure-data-lake-storage/current/mule-azure-data-lake-storage.xsd">
+
+    <!-- ============================ API (APIkit) ============================ -->
+    <flow name="cdc-control-api-main" doc:name="API main" doc:description="Recibe peticiones HTTP en /api/* y las enruta según el contrato RAML">
+        <http:listener config-ref="HTTP_Listener_config" path="/api/*"
+            doc:name="HTTP /api/*" doc:description="Punto de entrada de la API de control del CDC">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+                <http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
+            </http:error-response>
+        </http:listener>
+        <apikit:router config-ref="cdc-control-api-config"
+            doc:name="APIkit router" doc:description="Valida la petición contra el RAML y la enruta al flujo del recurso"/>
+        <error-handler>
+            <on-error-propagate type="APIKIT:BAD_REQUEST" doc:name="400" doc:description="La petición no cumple el contrato RAML">
+                <set-variable variableName="httpStatus" value="400" doc:name="Status 400" doc:description="Código HTTP 400 Bad Request"/>
+                <set-payload value='#[output application/json --- {message: "Bad request", detail: error.description}]' doc:name="Cuerpo 400" doc:description="Mensaje de error JSON para el cliente"/>
+            </on-error-propagate>
+            <on-error-propagate type="APIKIT:NOT_FOUND" doc:name="404" doc:description="Recurso inexistente">
+                <set-variable variableName="httpStatus" value="404" doc:name="Status 404" doc:description="Código HTTP 404 Not Found"/>
+                <set-payload value='#[output application/json --- {message: "Resource not found"}]' doc:name="Cuerpo 404" doc:description="Mensaje de error JSON para el cliente"/>
+            </on-error-propagate>
+            <on-error-propagate type="APIKIT:METHOD_NOT_ALLOWED" doc:name="405" doc:description="Método no permitido">
+                <set-variable variableName="httpStatus" value="405" doc:name="Status 405" doc:description="Código HTTP 405"/>
+                <set-payload value='#[output application/json --- {message: "Method not allowed"}]' doc:name="Cuerpo 405" doc:description="Mensaje de error JSON para el cliente"/>
+            </on-error-propagate>
+            <on-error-propagate type="APIKIT:UNSUPPORTED_MEDIA_TYPE, APIKIT:NOT_ACCEPTABLE" doc:name="415" doc:description="Tipo de contenido no soportado">
+                <set-variable variableName="httpStatus" value="415" doc:name="Status 415" doc:description="Código HTTP 415"/>
+                <set-payload value='#[output application/json --- {message: "Unsupported media type"}]' doc:name="Cuerpo 415" doc:description="Mensaje de error JSON para el cliente"/>
+            </on-error-propagate>
+            <on-error-propagate type="ANY" doc:name="500" doc:description="Error interno con correlationId para soporte">
+                <set-variable variableName="httpStatus" value="500" doc:name="Status 500" doc:description="Código HTTP 500"/>
+                <set-payload value='#[output application/json --- {message: "Internal error", correlationId: correlationId}]' doc:name="Cuerpo 500" doc:description="Mensaje de error JSON con correlationId de Mule"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- GET /trace/{correlationId} -->
+    <flow name="get:\trace\(correlationId):cdc-control-api-config" doc:name="GET /trace" doc:description="Devuelve todos los eventos de auditoría de un cambio por su correlationId">
+        <db:select config-ref="Audit_DB_Config" doc:name="Eventos del cambio" doc:description="Consulta CDC_AUDIT por correlationId ordenado por tiempo">
+            <db:sql><![CDATA[SELECT EVENT_TS, APP, STAGE, TABNAME, CORRELATION_ID, RECORDS, DETAIL
+FROM dbo.CDC_AUDIT WHERE CORRELATION_ID = :id ORDER BY EVENT_TS]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ id: attributes.uriParams.correlationId }]]]></db:input-parameters>
+        </db:select>
+        <ee:transform doc:name="Respuesta trace" doc:description="Arma la respuesta Trace con las etapas del cambio">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    correlationId: attributes.uriParams.correlationId,
+    found: not isEmpty(payload),
+    events: payload map {
+        eventTs: $.EVENT_TS,
+        app: $.APP,
+        stage: $.STAGE,
+        table: $.TABNAME,
+        correlationId: $.CORRELATION_ID,
+        records: $.RECORDS,
+        detail: $.DETAIL
+    }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- GET /health/lag -->
+    <flow name="get:\health\lag:cdc-control-api-config" doc:name="GET /health/lag" doc:description="Calcula el rezago de cada tabla contra el SLA de latencia de su dominio">
+        <db:select config-ref="Audit_DB_Config" doc:name="Último commit por tabla" doc:description="Último COMMITTED por tabla en CDC_AUDIT">
+            <db:sql><![CDATA[SELECT TABNAME, MAX(EVENT_TS) AS LAST_COMMIT
+FROM dbo.CDC_AUDIT WHERE STAGE = 'COMMITTED' AND CORRELATION_ID IS NULL
+GROUP BY TABNAME]]></db:sql>
+        </db:select>
+        <ee:transform doc:name="Rezago vs SLA" doc:description="Compara minutos desde el último commit contra el SLA definido en sla.json">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var sla = readUrl("classpath://sla.json", "application/json")
+var nowTs = now()
+---
+payload map ((r) -> do {
+    var lastUtc = ((r.LAST_COMMIT as LocalDateTime) as String {format: "yyyy-MM-dd'T'HH:mm:ss"} ++ "Z") as DateTime
+    var lag = ((nowTs as Number {unit: "seconds"}) - (lastUtc as Number {unit: "seconds"})) / 60
+    var slaMin = sla.tables[r.TABNAME] default sla.defaultMinutes
+    ---
+    {
+        table: r.TABNAME,
+        lastCommit: r.LAST_COMMIT,
+        lagMinutes: lag as String {format: "0.0"} as Number,
+        slaMinutes: slaMin,
+        status: if (lag <= slaMin) "OK" else "BREACH"
+    }
+})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- POST /reconcile -->
+    <flow name="post:\reconcile:application\json:cdc-control-api-config" doc:name="POST /reconcile" doc:description="Concilia cambios capturados contra registros aterrizados en ADLS para una tabla y fecha">
+        <set-variable variableName="req" value="#[payload]" doc:name="Petición" doc:description="Tabla y fecha a conciliar"/>
+        <db:select config-ref="Audit_DB_Config" doc:name="Capturados" doc:description="Suma de registros PUBLISHED por las apps de captura para la tabla y fecha">
+            <db:sql><![CDATA[SELECT COALESCE(SUM(RECORDS), 0) AS CAPTURED FROM dbo.CDC_AUDIT
+WHERE STAGE = 'PUBLISHED' AND CORRELATION_ID IS NULL AND TABNAME = :t AND CAST(EVENT_TS AS DATE) = :d]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ t: vars.req.table, d: vars.req.date }]]]></db:input-parameters>
+        </db:select>
+        <set-variable variableName="captured" value="#[payload[0].CAPTURED default 0]" doc:name="Total capturado" doc:description="Total de cambios publicados en MQ por la captura"/>
+        <set-variable variableName="landed" value="#[0]" doc:name="Total aterrizado" doc:description="Acumulador de registros según manifiestos del día"/>
+
+        <try doc:name="Leer manifiestos" doc:description="Lista los manifiestos de la tabla y fecha en ADLS y suma sus conteos">
+            <azure-data-lake-storage:list-paths config-ref="ADLS_Config" filesystem="${adls.fileSystem}" recursive="false"
+                directory="#[%dw 2.0 var d = vars.req.date as Date --- '_manifest/' ++ lower(vars.req.table replace '/' with '_') ++ '/yyyy=' ++ (d as String {format: 'yyyy'}) ++ '/mm=' ++ (d as String {format: 'MM'}) ++ '/dd=' ++ (d as String {format: 'dd'})]"
+                doc:name="Listar manifiestos" doc:description="Lista _manifest/tabla/yyyy=/mm=/dd=/ del día a conciliar"/>
+            <foreach collection="#[payload.paths default []]" doc:name="Por manifiesto" doc:description="Lee cada manifiesto y suma su conteo de registros">
+                <azure-data-lake-storage:read-path config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[payload.name]"
+                    doc:name="Leer manifiesto" doc:description="Descarga el JSON del manifiesto del archivo comprometido"/>
+                <set-variable variableName="landed" value="#[vars.landed + (read(payload, 'application/json').count default 0)]"
+                    doc:name="Sumar conteo" doc:description="Acumula el conteo del manifiesto"/>
+            </foreach>
+            <error-handler>
+                <on-error-continue type="AZURE-DATA-LAKE-STORAGE:NOT_FOUND" doc:name="Sin manifiestos" doc:description="No hay archivos aterrizados para ese día: aterrizado = 0">
+                    <logger level="INFO" message="#['Sin manifiestos para ' ++ vars.req.table ++ ' ' ++ vars.req.date]" doc:name="Log sin manifiestos" doc:description="Registra que el día no tiene archivos aterrizados"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+
+        <ee:transform doc:name="Resultado" doc:description="Calcula la diferencia capturado vs. aterrizado y el estatus MATCH/MISMATCH">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    table: vars.req.table,
+    date: vars.req.date,
+    captured: vars.captured,
+    landed: vars.landed,
+    diff: vars.captured - vars.landed,
+    status: if (vars.captured == vars.landed) "MATCH" else "MISMATCH"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="result" value="#[payload]" doc:name="Guardar resultado" doc:description="Conserva el resultado para responderlo tras auditarlo"/>
+        <db:insert config-ref="Audit_DB_Config" doc:name="Auditar conciliación" doc:description="Registra el resultado de la conciliación en CDC_AUDIT">
+            <db:sql><![CDATA[INSERT INTO dbo.CDC_AUDIT (EVENT_TS, APP, STAGE, TABNAME, RECORDS, DETAIL)
+VALUES (SYSUTCDATETIME(), 'cdc-control-api', 'RECONCILE', :t, :diff, :detail)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ t: payload.table, diff: payload.diff, detail: write(payload, "application/json") }]]]></db:input-parameters>
+        </db:insert>
+        <set-payload value="#[vars.result]" doc:name="Respuesta" doc:description="Devuelve el resultado de la conciliación"/>
+    </flow>
+
+    <!-- POST /resync -->
+    <flow name="post:\resync:application\json:cdc-control-api-config" doc:name="POST /resync" doc:description="Publica un comando de recarga acotada que ejecuta sap-initial-load (op = R)">
+        <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.resync}"
+            doc:name="Comando resync" doc:description="Encola la recarga de tabla/sociedad/ejercicio para sap-initial-load">
+            <anypoint-mq:body><![CDATA[#[output application/json --- payload ++ {requestedAt: now(), correlationId: correlationId}]]]></anypoint-mq:body>
+            <anypoint-mq:properties><![CDATA[#[{correlationId: correlationId}]]]></anypoint-mq:properties>
+        </anypoint-mq:publish>
+        <set-variable variableName="httpStatus" value="202" doc:name="Status 202" doc:description="La recarga se acepta y se ejecuta de forma asíncrona"/>
+        <set-payload value='#[output application/json --- {accepted: true, detail: "Resync encolado con correlationId " ++ correlationId}]'
+            doc:name="Respuesta" doc:description="Confirma que el comando quedó encolado"/>
+    </flow>
+
+    <!-- POST /dlq/replay -->
+    <flow name="post:\dlq\replay:application\json:cdc-control-api-config" doc:name="POST /dlq/replay" doc:description="Reintento nivel 4: reprocesa hasta N mensajes de la DLQ hacia la cola destino">
+        <set-variable variableName="req" value="#[payload]" doc:name="Petición" doc:description="Cola destino y máximo de mensajes a reprocesar"/>
+        <set-variable variableName="replayed" value="#[0]" doc:name="Contador" doc:description="Mensajes reprocesados"/>
+        <set-variable variableName="empty" value="#[false]" doc:name="DLQ vacía" doc:description="Bandera para dejar de consumir cuando la DLQ se vacía"/>
+        <foreach collection="#[1 to (vars.req.max default 50)]" doc:name="Hasta N mensajes" doc:description="Itera hasta el máximo solicitado o hasta vaciar la DLQ">
+            <choice doc:name="¿DLQ vacía?" doc:description="Evita consumir más si la DLQ ya no tiene mensajes">
+                <when expression="#[not vars.empty]" doc:name="Con mensajes" doc:description="Consume el siguiente mensaje de la DLQ">
+                    <try doc:name="Replay" doc:description="Consume, republica el original y confirma; si la DLQ está vacía marca la bandera">
+                        <anypoint-mq:consume config-ref="Anypoint_MQ_Config" destination="${amq.queue.dlq}"
+                            acknowledgementMode="MANUAL" acknowledgementTimeout="60" acknowledgementTimeoutUnit="SECONDS"
+                            pollingTime="2" pollingTimeUnit="SECONDS"
+                            doc:name="Consumir DLQ" doc:description="Toma el siguiente mensaje de cdc.dlq con ACK manual"/>
+                        <choice doc:name="¿Mensaje?" doc:description="Si consume no trajo mensaje, la DLQ está vacía">
+                            <when expression="#[isEmpty(payload)]" doc:name="Vacía" doc:description="No hay más mensajes en la DLQ">
+                                <raise-error type="APP:DLQ_EMPTY" description="La DLQ no tiene más mensajes" doc:name="Raise DLQ_EMPTY" doc:description="Sale del bloque y marca la DLQ como vacía"/>
+                            </when>
+                        </choice>
+                        <set-variable variableName="ackToken" value="#[attributes.ackToken]" doc:name="ackToken" doc:description="Token para confirmar el mensaje de la DLQ tras republicar"/>
+                        <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="#[vars.req.targetQueue]"
+                            doc:name="Republicar original" doc:description="Republica el sobre original; si MQ movió el mensaje directo a la DLQ (maxDeliveries) no hay sobre de error y se republica tal cual">
+                            <anypoint-mq:body><![CDATA[#[%dw 2.0 output application/json var m = read(payload, "application/json") --- m.original default m]]]></anypoint-mq:body>
+                            <anypoint-mq:properties><![CDATA[#[{correlationId: read(payload, "application/json").correlationId default "", replayed: "true"}]]]></anypoint-mq:properties>
+                        </anypoint-mq:publish>
+                        <anypoint-mq:ack config-ref="Anypoint_MQ_Config" ackToken="#[vars.ackToken]"
+                            doc:name="ACK DLQ" doc:description="Retira el mensaje de la DLQ una vez republicado"/>
+                        <set-variable variableName="replayed" value="#[vars.replayed + 1]" doc:name="Contar" doc:description="Incrementa el contador de mensajes reprocesados"/>
+                        <error-handler>
+                            <on-error-continue type="ANYPOINT-MQ:TIMEOUT, APP:DLQ_EMPTY" doc:name="DLQ vacía" doc:description="No hubo mensaje en el tiempo de polling: la DLQ está vacía">
+                                <set-variable variableName="empty" value="#[true]" doc:name="Marcar vacía" doc:description="Detiene los consumos restantes"/>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+                </when>
+            </choice>
+        </foreach>
+        <set-payload value='#[output application/json --- {accepted: true, detail: "Reprocesados " ++ (vars.replayed as String) ++ " mensajes hacia " ++ vars.req.targetQueue}]'
+            doc:name="Respuesta" doc:description="Resumen del replay"/>
+    </flow>
+
+    <!-- ===================== Conciliación diaria (03:00) ===================== -->
+    <flow name="reconcile-daily-flow" doc:name="Conciliación diaria" doc:description="Cada día a las 03:00 concilia el día anterior por tabla y solicita /resync de las tablas con diferencias">
+        <scheduler doc:name="03:00 diario" doc:description="Cron de conciliación (reconcile.cron)">
+            <scheduling-strategy>
+                <cron expression="${reconcile.cron}" timeZone="America/Mexico_City"/>
+            </scheduling-strategy>
+        </scheduler>
+        <set-variable variableName="reconDate" value="#[(today() - |P1D|) as String {format: 'yyyy-MM-dd'}]" doc:name="Ayer" doc:description="Fecha a conciliar: el día anterior completo"/>
+        <foreach collection="#[keysOf(readUrl('classpath://sla.json', 'application/json').tables) map ($ as String)]" doc:name="Por tabla" doc:description="Concilia cada tabla con SLA definido en sla.json">
+            <set-variable variableName="reconTable" value="#[payload]" doc:name="Tabla" doc:description="Tabla en conciliación"/>
+            <try doc:name="Conciliar tabla" doc:description="Una falla en una tabla no detiene la conciliación de las demás">
+                <set-payload value="#[{ table: vars.reconTable, date: vars.reconDate }]" doc:name="Petición" doc:description="Misma petición que POST /reconcile"/>
+                <flow-ref name="post:\reconcile:application\json:cdc-control-api-config" doc:name="Conciliar" doc:description="Capturado (auditoría) vs. aterrizado (manifiestos ADLS)"/>
+                <choice doc:name="¿Diferencias?" doc:description="Si no cuadra, solicita la recarga acotada de la tabla">
+                    <when expression="#[vars.result.status == 'MISMATCH']" doc:name="MISMATCH" doc:description="Solicita /resync y deja alerta en el log">
+                        <logger level="ERROR" category="cdc.trace"
+                            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("RECONCILE_MISMATCH", app.name, vars.result)]'
+                            doc:name="Log MISMATCH" doc:description="Dispara la alerta de Anypoint Monitoring"/>
+                        <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.resync}"
+                            doc:name="Solicitar resync" doc:description="Encola la recarga de la tabla para sap-initial-load">
+                            <anypoint-mq:body><![CDATA[#[output application/json --- { table: vars.reconTable, requestedAt: now(), reason: "RECONCILE_MISMATCH " ++ vars.reconDate }]]]></anypoint-mq:body>
+                        </anypoint-mq:publish>
+                    </when>
+                </choice>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Falla de conciliación" doc:description="Registra la falla y continúa con la siguiente tabla">
+                        <logger level="WARN" category="cdc.trace" message="#['Conciliación fallida para ' ++ vars.reconTable ++ ': ' ++ (error.description default '')]" doc:name="Log falla" doc:description="Advierte la tabla que no se pudo conciliar"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </foreach>
+    </flow>
+
+    <!-- ============================ Auditoría ============================ -->
+    <flow name="audit-ingest-flow" doc:name="Audit ingest" doc:description="Persiste en Azure SQL los eventos de auditoría que publican captura y entrega en cdc.audit">
+        <anypoint-mq:subscriber config-ref="Anypoint_MQ_Config" destination="${amq.queue.audit}"
+            doc:name="Subscriber cdc.audit" doc:description="Consume eventos PUBLISHED/COMMITTED; ACK automático solo si la inserción fue exitosa"/>
+        <ee:transform doc:name="Evento → filas" doc:description="Una fila resumen con conteo por tabla y una fila por correlationId para la traza">
+            <ee:message>
+                <ee:set-payload resource="dw/audit-rows.dwl"/>
+            </ee:message>
+        </ee:transform>
+        <db:bulk-insert config-ref="Audit_DB_Config" doc:name="Insertar auditoría" doc:description="Inserta en bloque las filas del evento en CDC_AUDIT">
+            <db:bulk-input-parameters><![CDATA[#[payload]]]></db:bulk-input-parameters>
+            <db:sql><![CDATA[INSERT INTO dbo.CDC_AUDIT (EVENT_TS, APP, STAGE, TABNAME, CORRELATION_ID, RECORDS, DETAIL)
+VALUES (:eventTs, :app, :stage, :tabname, :correlationId, :records, :detail)]]></db:sql>
+        </db:bulk-insert>
+    </flow>
+
+</mule>

@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sap-idoc-cdc — System layer de captura de DATOS MAESTROS por IDoc (change pointers)
+
+  Mensajes: DEBMAS (clientes) · CREMAS (proveedores) · MATMAS (materiales).
+  Entrega garantizada con SAP tRFC:
+    · El document-listener abre una transacción (ALWAYS_BEGIN) ligada al TID del IDoc.
+    · Solo si TODOS los sobres se publican en Anypoint MQ la transacción confirma y SAP
+      marca el IDoc como entregado.
+    · Ante cualquier error se propaga la excepción: SAP conserva el IDoc en SM58/BD87
+      y lo reintenta (job RSARFCEX) → cero pérdida.
+    · Orden por objeto: configurar qRFC (cola por cliente/material) en el puerto RFC de SAP.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:sap="http://www.mulesoft.org/schema/mule/sap"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/sap http://www.mulesoft.org/schema/mule/sap/current/mule-sap.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd">
+
+    <flow name="idoc-maestros-flow" doc:name="IDoc maestros" doc:description="Recibe IDocs de maestros vía tRFC y publica un sobre CDC por segmento en cdc.q.maestros">
+        <sap:document-listener config-ref="SAP_Config"
+            gatewayHost="${sap.gateway.host}" gatewayService="${sap.gateway.service}" programID="${sap.programId}"
+            connectionCount="${sap.connectionCount}" idocTypeFilterRegex="${sap.idocTypeFilterRegex}"
+            transactionalAction="ALWAYS_BEGIN"
+            doc:name="Escuchar IDocs" doc:description="Servidor RFC registrado en el Gateway SAP; transacción ligada al TID del IDoc"/>
+
+        <ee:transform doc:name="IDoc → sobres CDC" doc:description="Convierte cada segmento mapeado (KNA1, LFA1, MARA, MAKT...) en un sobre CDC; DOCNUM = correlationId">
+            <ee:message>
+                <ee:set-payload resource="dw/idoc-to-cdc.dwl"/>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="idocType"><![CDATA[%dw 2.0
+output application/java
+---
+(payload[0].*IDOC.EDI_DC40.IDOCTYP default []) distinctBy $ joinBy ","]]></ee:set-variable>
+                <ee:set-variable variableName="docnum"><![CDATA[%dw 2.0
+output application/java
+---
+(payload[0].*IDOC.EDI_DC40.DOCNUM default []) joinBy ","]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("CAPTURED", app.name, {correlationId: vars.docnum, idocType: vars.idocType, records: sizeOf(payload), tables: payload.source.table distinctBy $})]'
+            doc:name="Log CAPTURED" doc:description="Log JSON del IDoc recibido: DOCNUM, tipo y tablas afectadas"/>
+
+        <foreach doc:name="Publicar sobres" doc:description="Publica cada sobre en la cola de maestros dentro de la transacción tRFC">
+            <until-successful maxRetries="${retry.maxRetries}" millisBetweenRetries="${retry.millisBetweenRetries}"
+                doc:name="Retry publish" doc:description="Reintenta la publicación ante fallas transitorias de Anypoint MQ">
+                <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.maestros}" messageId="#[payload.cdcId]"
+                    doc:name="Publicar en MQ" doc:description="Publica el sobre CDC de maestros; messageId = cdcId">
+                    <anypoint-mq:body><![CDATA[#[output application/json --- payload]]]></anypoint-mq:body>
+                    <anypoint-mq:properties><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/java --- mqProperties(payload)]]]></anypoint-mq:properties>
+                </anypoint-mq:publish>
+            </until-successful>
+        </foreach>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("PUBLISHED", app.name, {correlationId: vars.docnum, idocType: vars.idocType, records: sizeOf(payload)})]'
+            doc:name="Log PUBLISHED" doc:description="Todos los sobres publicados: la transacción confirma y SAP marca el IDoc como entregado"/>
+
+        <foreach collection="#[(payload groupBy $.source.table) pluck ((items, t) -> {table: t as String, records: sizeOf(items), correlationIds: items.correlationId distinctBy $})]"
+            doc:name="Auditar por tabla" doc:description="Publica un evento PUBLISHED por tabla del IDoc con DOCNUM como correlationId">
+            <try doc:name="Auditoría best-effort" doc:description="Una falla de auditoría no debe revertir ni repetir la captura">
+                <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.audit}"
+            doc:name="Auditoría PUBLISHED" doc:description="Conteo capturado por tabla con DOCNUM para trazabilidad y conciliación">
+            <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- stageEvent("PUBLISHED", app.name, {table: payload.table, records: payload.records, correlationIds: payload.correlationIds})]]]></anypoint-mq:body>
+        </anypoint-mq:publish>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Ignorar falla de auditoría" doc:description="Registra la falla; la conciliación detectará el faltante">
+                        <logger level="WARN" category="cdc.trace" message="#['Auditoría no publicada: ' ++ (error.description default '')]" doc:name="Log auditoría fallida" doc:description="Advierte que el evento PUBLISHED no llegó a cdc.audit"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </foreach>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Devolver a SAP" doc:description="Rollback: SAP recibe la excepción y conserva el IDoc en SM58/BD87 para reintento">
+                <logger level="ERROR" category="cdc.trace"
+                    message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("CAPTURE_FAILED", app.name, {correlationId: vars.docnum default "", idocType: vars.idocType default "", error: error.errorType.identifier, description: error.description})]'
+                    doc:name="Log CAPTURE_FAILED" doc:description="Registra la falla; el IDoc queda pendiente en SAP, no se pierde"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+</mule>

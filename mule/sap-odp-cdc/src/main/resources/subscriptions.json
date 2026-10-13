@@ -1,0 +1,21 @@
+{
+  "_comment": "Suscripciones ODP expuestas vía SAP Gateway (SEGW / extractores genéricos RSO2). Llaves = llave de negocio SAP para el MERGE en el lake.",
+  "ventas": [
+    { "name": "ZODP_VBAK", "service": "ZODP_SD_SRV", "entitySet": "FactsOfZVBAK", "table": "VBAK", "keys": ["VBELN"] },
+    { "name": "ZODP_VBAP", "service": "ZODP_SD_SRV", "entitySet": "FactsOfZVBAP", "table": "VBAP", "keys": ["VBELN", "POSNR"] },
+    { "name": "ZODP_VBEP", "service": "ZODP_SD_SRV", "entitySet": "FactsOfZVBEP", "table": "VBEP", "keys": ["VBELN", "POSNR", "ETENR"] },
+    { "name": "ZODP_VBRK", "service": "ZODP_SD_SRV", "entitySet": "FactsOfZVBRK", "table": "VBRK", "keys": ["VBELN"] },
+    { "name": "ZODP_VBRP", "service": "ZODP_SD_SRV", "entitySet": "FactsOfZVBRP", "table": "VBRP", "keys": ["VBELN", "POSNR"] },
+    { "name": "ZODP_EKKO", "service": "ZODP_MM_SRV", "entitySet": "FactsOfZEKKO", "table": "EKKO", "keys": ["EBELN"] },
+    { "name": "ZODP_EKPO", "service": "ZODP_MM_SRV", "entitySet": "FactsOfZEKPO", "table": "EKPO", "keys": ["EBELN", "EBELP"] },
+    { "name": "ZODP_AFKO", "service": "ZODP_PP_SRV", "entitySet": "FactsOfZAFKO", "table": "AFKO", "keys": ["AUFNR"] }
+  ],
+  "finanzas": [
+    { "name": "ZODP_BKPF",  "service": "ZODP_FI_SRV", "entitySet": "FactsOfZBKPF",  "table": "BKPF",  "keys": ["BUKRS", "BELNR", "GJAHR"] },
+    { "name": "ZODP_BSIS",  "service": "ZODP_FI_SRV", "entitySet": "FactsOfZBSIS",  "table": "BSIS",  "keys": ["BUKRS", "HKONT", "AUGDT", "AUGBL", "ZUONR", "GJAHR", "BELNR", "BUZEI"] },
+    { "name": "ZODP_BSID",  "service": "ZODP_FI_SRV", "entitySet": "FactsOfZBSID",  "table": "BSID",  "keys": ["BUKRS", "KUNNR", "UMSKS", "UMSKZ", "AUGDT", "AUGBL", "ZUONR", "GJAHR", "BELNR", "BUZEI"] },
+    { "name": "ZODP_GLPCA", "service": "ZODP_CO_SRV", "entitySet": "FactsOfZGLPCA", "table": "GLPCA", "keys": ["GL_SIRID"] },
+    { "name": "ZODP_COSP",  "service": "ZODP_CO_SRV", "entitySet": "FactsOfZCOSP",  "table": "COSP",  "keys": ["LEDNR", "OBJNR", "GJAHR", "WRTTP", "VERSN", "KSTAR", "HRKFT", "VRGNG", "VBUND", "PARGB", "BEKNZ", "TWAER", "PERBL"] },
+    { "name": "ZODP_MSEG",  "service": "ZODP_MM_SRV", "entitySet": "FactsOfZMSEG",  "table": "MSEG",  "keys": ["MBLNR", "MJAHR", "ZEILE"] }
+  ]
+}

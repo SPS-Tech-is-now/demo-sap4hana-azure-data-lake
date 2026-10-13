@@ -1,0 +1,15 @@
+{
+  "_comment": "Plan de carga inicial (~75 GB). Partición = tabla × sociedad (BUKRS) × ejercicio (GJAHR). Tablas sin BUKRS/GJAHR usan 'ALL'. 'filter' es la condición WHERE que recibe Z_CDC_READ_TABLE.",
+  "companies": ["1000", "2000", "3000"],
+  "years": ["2022", "2023", "2024", "2025", "2026"],
+  "tables": [
+    { "table": "GLPCA", "domain": "finanzas", "keys": ["GL_SIRID"],                      "byCompany": "RBUKRS", "byYear": "RYEAR" },
+    { "table": "BSIS",  "domain": "finanzas", "keys": ["BUKRS", "HKONT", "GJAHR", "BELNR", "BUZEI"], "byCompany": "BUKRS",  "byYear": "GJAHR" },
+    { "table": "BKPF",  "domain": "finanzas", "keys": ["BUKRS", "BELNR", "GJAHR"],      "byCompany": "BUKRS",  "byYear": "GJAHR" },
+    { "table": "MSEG",  "domain": "finanzas", "keys": ["MBLNR", "MJAHR", "ZEILE"],      "byCompany": "BUKRS",  "byYear": "MJAHR" },
+    { "table": "COSP",  "domain": "finanzas", "keys": ["OBJNR", "GJAHR", "WRTTP", "VERSN", "KSTAR"], "byCompany": null, "byYear": "GJAHR" },
+    { "table": "VBAP",  "domain": "ventas",   "keys": ["VBELN", "POSNR"],               "byCompany": null,     "byYear": null },
+    { "table": "KNA1",  "domain": "maestros", "keys": ["KUNNR"],                        "byCompany": null,     "byYear": null },
+    { "table": "MARA",  "domain": "maestros", "keys": ["MATNR"],                        "byCompany": null,     "byYear": null }
+  ]
+}

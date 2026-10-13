@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pruebas de GARANTÍAS de adls-delivery (Artes Gráficas):
+   1. Camino feliz        → commit atómico (_tmp → rename → manifest) y ACK de cada mensaje.
+   2. Throttling/caída    → ADLS 503 persistente: until-successful reintenta y luego NACK (sin pérdida).
+   3. Error permanente    → ADLS 400: sin reintentos, registros a DLQ y ACK del original.
+   4. Duplicado           → mismo cdcId dos veces: el segundo se confirma sin reprocesar.
+   5. Sobre inválido      → mensaje corrupto a DLQ + ACK (no bloquea la cola).
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="adls-delivery-test-suite.xml"/>
+
+    <!-- Lote de prueba: 2 cambios de VBAP con sus ackTokens -->
+    <sub-flow name="given-batch-of-two">
+        <set-payload doc:name="Lote VBAP x2" value='#[[
+            { record: { cdcId: "c-1", correlationId: "corr-1", source: { system: "ECC_PRD", client: "300", mechanism: "ODP", table: "VBAP" }, op: "U", key: { VBELN: "0000123456", POSNR: "000010" }, changeTs: "2026-10-13T15:02:11Z", seq: 10, watermark: "W1", before: null, after: { NETWR: 100 } }, ackToken: "tok-1", correlationId: "corr-1" },
+            { record: { cdcId: "c-2", correlationId: "corr-2", source: { system: "ECC_PRD", client: "300", mechanism: "ODP", table: "VBAP" }, op: "I", key: { VBELN: "0000123457", POSNR: "000010" }, changeTs: "2026-10-13T15:02:12Z", seq: 11, watermark: "W1", before: null, after: { NETWR: 200 } }, ackToken: "tok-2", correlationId: "corr-2" }
+        ]]'/>
+    </sub-flow>
+
+    <!-- 1. Camino feliz -->
+    <munit:test name="commit-happy-path-acks-after-commit" description="Commit atómico completo y ACK de los 2 mensajes solo después del manifiesto">
+        <munit:behavior>
+            <munit-tools:mock-when processor="azure-data-lake-storage:create-or-rename">
+                <munit-tools:then-return><munit-tools:payload value="#[null]"/></munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="azure-data-lake-storage:update-path">
+                <munit-tools:then-return><munit-tools:payload value="#[null]"/></munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:ack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:publish">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="given-batch-of-two"/>
+            <flow-ref name="commit-batch-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <!-- 1 archivo (misma tabla): create _tmp + rename + create manifest = 3 -->
+            <munit-tools:verify-call processor="azure-data-lake-storage:create-or-rename" times="3"/>
+            <!-- append + flush del jsonl y append + flush del manifest = 4 -->
+            <munit-tools:verify-call processor="azure-data-lake-storage:update-path" times="4"/>
+            <munit-tools:verify-call processor="anypoint-mq:ack" times="2"/>
+            <munit-tools:verify-call processor="anypoint-mq:nack" times="0"/>
+            <!-- los 2 cdcId se registran como comprometidos solo después del manifiesto -->
+            <munit-tools:verify-call processor="os:store" times="2"/>
+            <!-- evento de auditoría COMMITTED -->
+            <munit-tools:verify-call processor="anypoint-mq:publish" times="1"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 2. Error transitorio persistente -->
+    <munit:test name="adls-503-retries-then-nacks" description="ADLS 503 persistente: 1 intento + 5 reintentos y NACK de todo el lote (nada se pierde)">
+        <munit:behavior>
+            <munit-tools:mock-when processor="azure-data-lake-storage:create-or-rename">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="AZURE-DATA-LAKE-STORAGE:SERVICE_UNAVAILABLE"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:nack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="given-batch-of-two"/>
+            <flow-ref name="commit-batch-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="azure-data-lake-storage:create-or-rename" times="6"/>
+            <munit-tools:verify-call processor="anypoint-mq:nack" times="2"/>
+            <munit-tools:verify-call processor="anypoint-mq:ack" times="0"/>
+            <munit-tools:verify-call processor="azure-data-lake-storage:update-path" times="0"/>
+            <!-- nada se marca como comprometido: la reentrega SÍ se procesará -->
+            <munit-tools:verify-call processor="os:store" times="0"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 3. Error permanente -->
+    <munit:test name="adls-400-goes-to-dlq-without-retry" description="ADLS 400: sin reintentos, cada registro a la DLQ y ACK de los originales">
+        <munit:behavior>
+            <munit-tools:mock-when processor="azure-data-lake-storage:create-or-rename">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="AZURE-DATA-LAKE-STORAGE:BAD_REQUEST"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:publish">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:ack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="given-batch-of-two"/>
+            <flow-ref name="commit-batch-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="azure-data-lake-storage:create-or-rename" times="1"/>
+            <munit-tools:verify-call processor="anypoint-mq:publish" times="2">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="destination" whereValue="cdc.dlq"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <munit-tools:verify-call processor="anypoint-mq:ack" times="2"/>
+            <munit-tools:verify-call processor="anypoint-mq:nack" times="0"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4. Duplicado: solo se descarta lo que YA está comprometido en el lake -->
+    <munit:test name="duplicate-cdcId-is-acked-not-reprocessed" description="Un cdcId ya comprometido en ADLS se confirma (ACK) sin llegar al micro-lote">
+        <munit:behavior>
+            <munit-tools:mock-when processor="os:contains">
+                <munit-tools:then-return><munit-tools:payload value="#[true]"/></munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:ack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Reentrega de un cambio ya aterrizado">
+                <munit:payload value='#[{ cdcId: "dup-1", correlationId: "corr-dup", source: { system: "ECC_PRD", client: "300", mechanism: "IDOC", table: "KNA1" }, op: "U", key: { KUNNR: "0000100001" }, changeTs: "2026-10-13T15:00:00Z", seq: 1, watermark: "IDOC:1", before: null, after: { NAME1: "Artes Graficas" } }]'/>
+                <munit:attributes value='#[{ackToken: "tok-dup", properties: {correlationId: "corr-dup"}}]'/>
+            </munit:set-event>
+            <try>
+                <flow-ref name="ingest-sub-flow"/>
+                <error-handler ref="ingest-error-handler"/>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="logger" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Log RECEIVED"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <munit-tools:verify-call processor="logger" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Log DUPLICATE"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <munit-tools:verify-call processor="anypoint-mq:ack" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="ackToken" whereValue="tok-dup"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4b. Reentrega tras un NACK: un cdcId visto pero NO comprometido SÍ se procesa -->
+    <munit:test name="redelivery-after-nack-is-reprocessed" description="Un cdcId que no llegó a comprometerse vuelve a entrar al micro-lote (no se pierde)">
+        <munit:behavior>
+            <munit-tools:mock-when processor="os:contains">
+                <munit-tools:then-return><munit-tools:payload value="#[false]"/></munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Reentrega de un cambio NO aterrizado">
+                <munit:payload value='#[{ cdcId: "nack-1", correlationId: "corr-nack", source: { system: "ECC_PRD", client: "300", mechanism: "ODP", table: "BSIS" }, op: "I", key: { BELNR: "1900000001" }, changeTs: "2026-10-13T15:00:00Z", seq: 5, watermark: "W", before: null, after: { DMBTR: 10 } }]'/>
+                <munit:attributes value='#[{ackToken: "tok-redelivered", properties: {correlationId: "corr-nack"}}]'/>
+            </munit:set-event>
+            <flow-ref name="ingest-sub-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="logger" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Log RECEIVED"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 5. Sobre inválido -->
+    <munit:test name="invalid-envelope-goes-to-dlq-and-acks" description="Un mensaje sin cdcId va a la DLQ y se confirma para no bloquear la cola">
+        <munit:behavior>
+            <munit-tools:mock-when processor="anypoint-mq:publish">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:ack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Sobre corrupto">
+                <munit:payload value='#[{ op: "X", source: { table: "VBAP" } }]'/>
+                <munit:attributes value='#[{ackToken: "tok-bad", properties: {correlationId: "corr-bad"}}]'/>
+            </munit:set-event>
+            <try>
+                <flow-ref name="ingest-sub-flow"/>
+                <error-handler ref="ingest-error-handler"/>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="anypoint-mq:publish" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="destination" whereValue="cdc.dlq"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <munit-tools:verify-call processor="anypoint-mq:ack" times="1"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

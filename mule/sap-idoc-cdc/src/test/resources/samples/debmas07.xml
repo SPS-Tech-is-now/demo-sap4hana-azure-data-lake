@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DEBMAS07>
+  <IDOC BEGIN="1">
+    <EDI_DC40 SEGMENT="1">
+      <DOCNUM>0000000000004711</DOCNUM>
+      <IDOCTYP>DEBMAS07</IDOCTYP>
+      <MESTYP>DEBMAS</MESTYP>
+      <CREDAT>20261013</CREDAT>
+      <CRETIM>150211</CRETIM>
+    </EDI_DC40>
+    <E1KNA1M SEGMENT="1">
+      <MSGFN>004</MSGFN>
+      <KUNNR>0000100001</KUNNR>
+      <NAME1>Impresos del Bajio SA de CV</NAME1>
+      <LAND1>MX</LAND1>
+      <E1KNVVM SEGMENT="1">
+        <MSGFN>004</MSGFN>
+        <VKORG>1000</VKORG>
+        <VTWEG>10</VTWEG>
+        <SPART>00</SPART>
+        <KDGRP>02</KDGRP>
+      </E1KNVVM>
+    </E1KNA1M>
+  </IDOC>
+</DEBMAS07>

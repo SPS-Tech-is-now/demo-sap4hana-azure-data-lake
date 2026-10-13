@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artesgraficas.mx/schemas/cdc-envelope/1.0",
+  "title": "Sobre CDC canónico — Artes Gráficas",
+  "description": "Contrato común que publican todas las apps de captura (IDOC, ODP, TRIGGER, SNAPSHOT) hacia Anypoint MQ.",
+  "type": "object",
+  "required": ["cdcId", "correlationId", "source", "op", "key", "changeTs", "seq", "watermark"],
+  "additionalProperties": false,
+  "properties": {
+    "cdcId":         { "type": "string", "description": "Id único del cambio; llave de idempotencia en adls-delivery." },
+    "correlationId": { "type": "string", "description": "Hilo de trazabilidad SAP → Mule → Lake → Auditoría." },
+    "source": {
+      "type": "object",
+      "required": ["system", "mechanism", "table"],
+      "additionalProperties": false,
+      "properties": {
+        "system":    { "type": "string", "examples": ["ECC_PRD"] },
+        "client":    { "type": "string", "examples": ["300"] },
+        "mechanism": { "enum": ["IDOC", "ODP", "TRIGGER", "SNAPSHOT"] },
+        "table":     { "type": "string", "pattern": "^[A-Z0-9_/]+$" }
+      }
+    },
+    "op":        { "enum": ["I", "U", "D", "R"], "description": "I insert · U update · D delete · R refresh (full/initial load)" },
+    "key":       { "type": "object", "minProperties": 1, "description": "Llave de negocio SAP (para MERGE en el lake)." },
+    "changeTs":  { "type": "string", "format": "date-time" },
+    "seq":       { "type": "integer", "minimum": 0, "description": "Orden monótono por fuente; last-writer-wins." },
+    "watermark": { "type": "string", "description": "Posición en la fuente; se confirma solo tras commit en ADLS." },
+    "before":    { "type": ["object", "null"] },
+    "after":     { "type": ["object", "null"] }
+  }
+}

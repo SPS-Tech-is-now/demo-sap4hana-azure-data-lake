@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  hana-trigger-cdc — System layer de captura por TRIGGERS de HANA (solo Opción 1: licencia enterprise)
+
+  Transaccionalidad:
+    · Un scheduler lee ZCDC_LOG con STATUS = 'NEW' ORDER BY SEQ (sin watermark: un SEQ asignado
+      en una LUW larga que se confirma tarde se toma en el siguiente ciclo, no se salta).
+    · Cada fila se procesa en SU PROPIA transacción local: lee la imagen after, publica el sobre
+      en MQ y marca la fila como PROCESSED.
+    · Si publicar falla → rollback: la fila sigue NEW y se reintenta en el siguiente ciclo.
+      Si publicó pero falló el commit, el reintento genera el MISMO cdcId (semilla ZCDC_LOG:SEQ)
+      y adls-delivery lo descarta como duplicado.
+  Captura borrados (D) de forma nativa: p. ej. BSID → BSAD al compensar partidas.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd">
+
+    <flow name="zcdc-log-listener-flow" maxConcurrency="1" doc:name="ZCDC_LOG poller" doc:description="Cada minuto lee las filas NEW del log de triggers y procesa cada una en su propia transacción">
+        <scheduler doc:name="Cada minuto" doc:description="Frecuencia de lectura del log (listener.frequencyMs); en CloudHub corre solo en el nodo primario">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${listener.frequencyMs}" startDelay="15000"/>
+            </scheduling-strategy>
+        </scheduler>
+        <db:select config-ref="HANA_Config" maxRows="${listener.maxRows}"
+            doc:name="Filas NEW" doc:description="Lee las filas pendientes por orden de SEQ (sin watermark: no se salta filas confirmadas tarde)">
+            <db:sql><![CDATA[#["SELECT SEQ, TABNAME, OP, KEY_JSON, CHANGE_TS FROM " ++ p('hana.schema') ++ ".ZCDC_LOG WHERE STATUS = 'NEW' ORDER BY SEQ"]]]></db:sql>
+        </db:select>
+        <foreach doc:name="Por fila" doc:description="Procesa cada fila del log; una falla no detiene a las siguientes">
+            <try transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL" doc:name="Transacción por fila" doc:description="Lectura de la imagen, publicación y marca PROCESSED como unidad">
+                <flow-ref name="process-log-row-sub-flow" doc:name="Procesar fila" doc:description="Imagen after → sobre CDC → MQ → PROCESSED"/>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Fila fallida" doc:description="Rollback de la fila (sigue NEW) y continúa con la siguiente">
+                        <logger level="ERROR" category="cdc.trace"
+                            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("CAPTURE_FAILED", app.name, {table: vars.logRow.TABNAME default "", seq: vars.logRow.SEQ default -1, error: error.errorType.identifier, description: error.description})]'
+                            doc:name="Log CAPTURE_FAILED" doc:description="Registra la falla; la fila se reprocesa en el siguiente ciclo"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </foreach>
+    </flow>
+
+    <sub-flow name="process-log-row-sub-flow" doc:name="Process log row" doc:description="Convierte una fila de ZCDC_LOG en sobre CDC, lo publica y marca la fila como PROCESSED">
+
+        <ee:transform doc:name="Preparar lectura" doc:description="Valida la tabla contra la lista blanca y arma el SELECT por llave de la imagen after">
+            <ee:variables>
+                <ee:set-variable variableName="logRow"><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-variable>
+                <ee:set-variable variableName="tableCfg"><![CDATA[%dw 2.0
+output application/java
+---
+readUrl("classpath://trigger-tables.json", "application/json")[payload.TABNAME]]]></ee:set-variable>
+                <ee:set-variable variableName="key"><![CDATA[%dw 2.0
+output application/java
+---
+read(payload.KEY_JSON, "application/json")]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="¿Tabla permitida?" doc:description="Solo se procesan tablas de la lista blanca trigger-tables.json">
+            <when expression="#[vars.tableCfg == null]" doc:name="No permitida" doc:description="Tabla fuera de la lista blanca: se detiene la fila">
+                <raise-error type="APP:TABLE_NOT_ALLOWED" description="La tabla del log no está en trigger-tables.json"
+                    doc:name="Raise TABLE_NOT_ALLOWED" doc:description="Rollback de la fila; requiere agregar la tabla a la lista blanca"/>
+            </when>
+        </choice>
+
+        <choice doc:name="¿Borrado?" doc:description="Para I/U lee la imagen completa; para D basta la llave">
+            <when expression="#[vars.logRow.OP != 'D']" doc:name="Insert/Update" doc:description="Lee la fila actual de la tabla SAP por su llave">
+                <db:select config-ref="HANA_Config"
+                    doc:name="Leer imagen after" doc:description="SELECT por llave sobre la tabla SAP en la misma transacción del listener">
+                    <db:sql><![CDATA[#["SELECT * FROM " ++ p('hana.schema') ++ "." ++ vars.logRow.TABNAME ++ " WHERE " ++ ((vars.tableCfg.keys map ($ ++ " = :" ++ $)) joinBy " AND ")]]]></db:sql>
+                    <db:input-parameters><![CDATA[#[vars.key]]]></db:input-parameters>
+                </db:select>
+            </when>
+            <otherwise doc:name="Delete" doc:description="La fila ya no existe en SAP; se emite solo la llave">
+                <set-payload value="#[[]]" doc:name="Sin imagen" doc:description="Payload vacío: el sobre llevará op=D con la llave en before"/>
+            </otherwise>
+        </choice>
+
+        <ee:transform doc:name="Fila → sobre CDC" doc:description="Construye el sobre CDC con seq = SEQ del log y watermark = ZCDC_LOG:SEQ">
+            <ee:message>
+                <ee:set-payload resource="dw/log-to-cdc.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="#[p('amq.queue.' ++ vars.tableCfg.domain)]" messageId="#[payload.cdcId]"
+            doc:name="Publicar en MQ" doc:description="Publica el sobre en la cola del dominio; si falla, rollback y la fila se relee">
+            <anypoint-mq:body><![CDATA[#[output application/json --- payload]]]></anypoint-mq:body>
+            <anypoint-mq:properties><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/java --- mqProperties(payload)]]]></anypoint-mq:properties>
+        </anypoint-mq:publish>
+
+        <db:update config-ref="HANA_Config"
+            doc:name="Marcar PROCESSED" doc:description="Marca la fila del log como procesada dentro de la misma transacción">
+            <db:sql><![CDATA[#["UPDATE " ++ p('hana.schema') ++ ".ZCDC_LOG SET STATUS = 'PROCESSED' WHERE SEQ = :seq"]]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ seq: vars.logRow.SEQ }]]]></db:input-parameters>
+        </db:update>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("PUBLISHED", app.name, {correlationId: payload.correlationId, table: vars.logRow.TABNAME, op: payload.op, seq: vars.logRow.SEQ})]'
+            doc:name="Log PUBLISHED" doc:description="Log JSON del cambio publicado con su SEQ del log"/>
+
+        <try doc:name="Auditoría best-effort" doc:description="Una falla de auditoría no debe revertir ni repetir la captura">
+            <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.audit}"
+            doc:name="Auditoría PUBLISHED" doc:description="Evento PUBLISHED por cambio con su correlationId">
+            <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- stageEvent("PUBLISHED", app.name, {table: vars.logRow.TABNAME, records: 1, correlationIds: [payload.correlationId]})]]]></anypoint-mq:body>
+        </anypoint-mq:publish>
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Ignorar falla de auditoría" doc:description="Registra la falla; la conciliación detectará el faltante">
+                    <logger level="WARN" category="cdc.trace" message="#['Auditoría no publicada: ' ++ (error.description default '')]" doc:name="Log auditoría fallida" doc:description="Advierte que el evento PUBLISHED no llegó a cdc.audit"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+
+    </sub-flow>
+
+</mule>

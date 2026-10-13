@@ -1,0 +1,9 @@
+{
+  "_comment": "Lista blanca de tablas capturadas por trigger: dominio (cola destino) y llave de negocio. Solo estas tablas se consultan (evita SQL dinámico arbitrario).",
+  "VBAP":            { "domain": "ventas",   "keys": ["MANDT", "VBELN", "POSNR"] },
+  "BSID":            { "domain": "finanzas", "keys": ["MANDT", "BUKRS", "KUNNR", "GJAHR", "BELNR", "BUZEI"] },
+  "BSIK":            { "domain": "finanzas", "keys": ["MANDT", "BUKRS", "LIFNR", "GJAHR", "BELNR", "BUZEI"] },
+  "JEST":            { "domain": "ventas",   "keys": ["MANDT", "OBJNR", "STAT"] },
+  "RESB":            { "domain": "ventas",   "keys": ["MANDT", "RSNUM", "RSPOS", "RSART"] },
+  "ZSD_CANC_PEDIDO": { "domain": "ventas",   "keys": ["MANDT", "VBELN"] }
+}

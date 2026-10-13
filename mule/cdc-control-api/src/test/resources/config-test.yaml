@@ -1,0 +1,24 @@
+# cdc-control-api — configuración entorno DEV (Artes Gráficas)
+http:
+  port: "8081"
+
+audit:
+  db:
+    host: "ag-cdc-audit.database.windows.net"
+    port: "1433"
+    name: "cdcaudit"
+
+adls:
+  baseUri:    "https://agdatalake.dfs.core.windows.net"
+  tokenUrl:   "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/oauth2/v2.0/token"   # reemplazar por el Tenant ID de Entra ID
+  fileSystem: "datalake"
+
+amq:
+  url: "https://mq-us-east-1.anypoint.mulesoft.com/api/v1"
+  queue:
+    audit:  "cdc.audit"
+    dlq:    "cdc.dlq"
+    resync: "cdc.cmd.resync"
+
+reconcile:
+  cron: "0 0 3 * * ?"           # conciliación diaria del día anterior

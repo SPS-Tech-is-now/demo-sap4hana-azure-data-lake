@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Smoke test de adls-delivery: MUnit inicializa de forma lazy, por lo que se invoca CADA flujo
+  (con los conectores mockeados) para forzar la compilación de todas las expresiones
+  DataWeave y la validación de la configuración. Errores de ejecución por datos de prueba
+  se ignoran; un error de COMPILACIÓN hace fallar la prueba.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="adls-delivery-smoke-test-suite.xml"/>
+
+    <munit:test name="adls-delivery-all-flows-compile" description="Todos los flujos inicializan y sus expresiones DataWeave compilan">
+        <munit:behavior>
+            <munit-tools:mock-when processor="anypoint-mq:publish">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:ack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:nack">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="azure-data-lake-storage:create-or-rename">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="azure-data-lake-storage:update-path">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="azure-data-lake-storage:get-path-properties">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <try doc:name="Inicializar subscribe-maestros-flow">
+                <flow-ref name="subscribe-maestros-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar subscribe-ventas-flow">
+                <flow-ref name="subscribe-ventas-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar subscribe-finanzas-flow">
+                <flow-ref name="subscribe-finanzas-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar subscribe-catalogos-flow">
+                <flow-ref name="subscribe-catalogos-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar commit-batch-flow">
+                <flow-ref name="commit-batch-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <set-payload value="#[app.name]" doc:name="Nombre de la app"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::notNullValue()]"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:sap="http://www.mulesoft.org/schema/mule/sap"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/sap http://www.mulesoft.org/schema/mule/sap/current/mule-sap.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+    <global-property name="env" value="dev" doc:name="Entorno" doc:description="Entorno por defecto; en CloudHub 2.0 se sobreescribe con la propiedad env"/>
+
+    <configuration-properties file="config-${env}.yaml"
+        doc:name="Config por entorno" doc:description="Conexión SAP, ventana nocturna, concurrencia y tamaño de página de la carga inicial"/>
+
+    <secure-properties:config name="Secure_Properties" file="secure-${env}.yaml" key="${mule.key}"
+        doc:name="Secure properties" doc:description="Secretos cifrados AES-CBC (usuario RFC de SAP y Anypoint MQ)">
+        <secure-properties:encrypt algorithm="AES" mode="CBC"/>
+    </secure-properties:config>
+
+    <sap:sap-config name="SAP_Config"
+        doc:name="SAP ECC" doc:description="Conexión JCo a SAP ECC on HANA para lecturas masivas vía Z_CDC_READ_TABLE">
+        <sap:simple-connection-provider-connection
+            applicationServerHost="${sap.host}" systemNumber="${sap.systemNumber}" client="${sap.client}"
+            username="${secure::sap.user}" password="${secure::sap.password}" language="ES">
+            <reconnection>
+                <reconnect frequency="10000" count="30"/>
+            </reconnection>
+        </sap:simple-connection-provider-connection>
+    </sap:sap-config>
+
+    <anypoint-mq:config name="Anypoint_MQ_Config"
+        doc:name="Anypoint MQ" doc:description="Destino de los registros de carga inicial (op=R), mismo contrato que el delta">
+        <anypoint-mq:connection url="${amq.url}"
+            clientId="${secure::amq.clientId}" clientSecret="${secure::amq.clientSecret}">
+            <reconnection>
+                <reconnect frequency="5000" count="10"/>
+            </reconnection>
+        </anypoint-mq:connection>
+    </anypoint-mq:config>
+
+    <os:object-store name="Partition_Store" persistent="true"
+        doc:name="Partition store" doc:description="Estado por partición PENDING/RUNNING/DONE/FAILED: permite reanudar la carga donde se quedó"/>
+
+</mule>

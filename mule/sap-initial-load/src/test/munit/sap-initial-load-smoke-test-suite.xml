@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sap-initial-load: pruebas unitarias del plan de particiones y del mapeo RFC → sobres op = R.
+  Los flujos con el SAP Connector requieren SAP JCo (sapjco3), que no se distribuye por Maven.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="sap-initial-load-smoke-test-suite.xml"/>
+
+    <munit:test name="partitions-expand-table-company-year" description="partitions.json se expande en tabla x BUKRS x GJAHR (68 particiones)">
+        <munit:execution>
+            <ee:transform doc:name="Construir particiones">
+                <ee:message><ee:set-payload resource="dw/build-partitions.dwl"/></ee:message>
+            </ee:transform>
+        </munit:execution>
+        <munit:validation>
+            <!-- GLPCA, BSIS, BKPF, MSEG: 3 sociedades x 5 años = 60 · COSP: 5 años · VBAP, KNA1, MARA: 1 c/u -->
+            <munit-tools:assert-that expression="#[sizeOf(payload)]" is="#[MunitTools::equalTo(68)]"/>
+            <munit-tools:assert-that expression="#[payload[0].id]" is="#[MunitTools::equalTo('GLPCA|1000|2022')]"/>
+            <munit-tools:assert-that expression="#[payload[0].filter]" is="#[MunitTools::equalTo(&quot;RBUKRS = '1000' AND RYEAR = '2022'&quot;)]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="rfc-page-maps-to-refresh-envelopes" description="Una página de Z_CDC_READ_TABLE produce sobres op=R con seq=0 y la llave de la partición">
+        <munit:execution>
+            <set-variable variableName="partition" value='#[{ id: "VBAP|ALL|ALL", table: "VBAP", domain: "ventas", keys: ["VBELN", "POSNR"], filter: "" }]'/>
+            <set-variable variableName="offset" value="#[0]"/>
+            <set-payload value='#[{ Z_CDC_READ_TABLE: { export: { ET_DATA: write([{VBELN: "0000123456", POSNR: "000010", NETWR: 100}, {VBELN: "0000123456", POSNR: "000020", NETWR: 250}], "application/json") } } }]'/>
+            <ee:transform doc:name="Página a sobres R">
+                <ee:message><ee:set-payload resource="dw/rfc-page-to-cdc.dwl"/></ee:message>
+            </ee:transform>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[sizeOf(payload)]" is="#[MunitTools::equalTo(2)]"/>
+            <munit-tools:assert-that expression="#[payload[1].op]" is="#[MunitTools::equalTo('R')]"/>
+            <munit-tools:assert-that expression="#[payload[1].seq]" is="#[MunitTools::equalTo(0)]"/>
+            <munit-tools:assert-that expression="#[payload[1].key.POSNR]" is="#[MunitTools::equalTo('000020')]"/>
+            <munit-tools:assert-that expression="#[payload[1].source.mechanism]" is="#[MunitTools::equalTo('SNAPSHOT')]"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

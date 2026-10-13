@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+    <global-property name="env" value="dev" doc:name="Entorno" doc:description="Entorno por defecto; en CloudHub 2.0 se sobreescribe con la propiedad env"/>
+
+    <configuration-properties file="config-${env}.yaml"
+        doc:name="Config por entorno" doc:description="Conexión HANA, esquema SAP, frecuencia de lectura del log y colas del entorno activo"/>
+
+    <secure-properties:config name="Secure_Properties" file="secure-${env}.yaml" key="${mule.key}"
+        doc:name="Secure properties" doc:description="Secretos cifrados AES-CBC (usuario técnico HANA y Anypoint MQ)">
+        <secure-properties:encrypt algorithm="AES" mode="CBC"/>
+    </secure-properties:config>
+
+    <db:config name="HANA_Config" doc:name="SAP HANA" doc:description="Conexión JDBC a SAP HANA (driver ngdbc) para leer ZCDC_LOG y las imágenes after">
+        <db:generic-connection url="${hana.url}" driverClassName="com.sap.db.jdbc.Driver"
+            user="${secure::hana.user}" password="${secure::hana.password}">
+            <db:pooling-profile maxPoolSize="4" minPoolSize="1"/>
+        </db:generic-connection>
+    </db:config>
+
+    <anypoint-mq:config name="Anypoint_MQ_Config"
+        doc:name="Anypoint MQ" doc:description="Destino de los sobres CDC capturados por trigger">
+        <anypoint-mq:connection url="${amq.url}"
+            clientId="${secure::amq.clientId}" clientSecret="${secure::amq.clientSecret}">
+            <reconnection>
+                <reconnect frequency="5000" count="10"/>
+            </reconnection>
+        </anypoint-mq:connection>
+    </anypoint-mq:config>
+
+</mule>

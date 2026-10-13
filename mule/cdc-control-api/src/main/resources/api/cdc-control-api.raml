@@ -1,0 +1,101 @@
+#%RAML 1.0
+title: CDC Control API — Artes Gráficas
+version: v1
+description: |
+  Experience API de operación del CDC SAP → Azure Data Lake.
+  Trazabilidad por correlationId, salud/rezago por tabla, conciliación capturado vs. aterrizado,
+  re-sincronización acotada y replay de la DLQ.
+mediaType: application/json
+protocols: [ HTTPS ]
+baseUri: https://cdc-control-api.artesgraficas.mx/api/{version}
+
+types:
+  AuditEvent:
+    properties:
+      eventTs: datetime
+      app: string
+      stage:
+        enum: [ PUBLISHED, COMMITTED, DLQ, RECONCILE ]
+      table?: string | nil
+      correlationId?: string | nil
+      records?: integer | nil
+      detail?: string | nil
+  Trace:
+    properties:
+      correlationId: string
+      found: boolean
+      events: AuditEvent[]
+  TableLag:
+    properties:
+      table: string
+      lastCommit: datetime
+      lagMinutes: number
+      slaMinutes: number
+      status:
+        enum: [ OK, BREACH ]
+  ReconcileRequest:
+    properties:
+      table: string
+      date: date-only
+  ReconcileResult:
+    properties:
+      table: string
+      date: date-only
+      captured: integer
+      landed: integer
+      diff: integer
+      status:
+        enum: [ MATCH, MISMATCH ]
+  ResyncRequest:
+    properties:
+      table: string
+      company?: string
+      year?: string
+  ReplayRequest:
+    properties:
+      targetQueue: string
+      max:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+  Accepted:
+    properties:
+      accepted: boolean
+      detail: string
+
+/trace/{correlationId}:
+  uriParameters:
+    correlationId: string
+  get:
+    description: Recorrido completo de un cambio (eventos de auditoría por etapa).
+    responses:
+      200:
+        body: Trace
+/health/lag:
+  get:
+    description: Rezago (now − último commit) por tabla contra el SLA de su dominio.
+    responses:
+      200:
+        body: TableLag[]
+/reconcile:
+  post:
+    description: Compara cambios capturados (auditoría PUBLISHED) contra registros aterrizados (manifiestos en ADLS).
+    body: ReconcileRequest
+    responses:
+      200:
+        body: ReconcileResult
+/resync:
+  post:
+    description: Solicita una recarga acotada (op = R) por tabla, sociedad y ejercicio; la ejecuta sap-initial-load.
+    body: ResyncRequest
+    responses:
+      202:
+        body: Accepted
+/dlq/replay:
+  post:
+    description: Reprocesa hasta N mensajes de la DLQ hacia la cola indicada, tras corregir la causa raíz.
+    body: ReplayRequest
+    responses:
+      200:
+        body: Accepted

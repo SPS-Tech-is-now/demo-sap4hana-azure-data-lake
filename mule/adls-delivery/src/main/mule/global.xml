@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:azure-data-lake-storage="http://www.mulesoft.org/schema/mule/azure-data-lake-storage"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/azure-data-lake-storage http://www.mulesoft.org/schema/mule/azure-data-lake-storage/current/mule-azure-data-lake-storage.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+    <!-- ============ Propiedades (env = dev | qa | prod) ============ -->
+    <global-property name="env" value="dev" doc:name="Entorno" doc:description="Entorno por defecto; en CloudHub 2.0 se sobreescribe con la propiedad env"/>
+
+    <configuration-properties file="config-${env}.yaml"
+        doc:name="Config por entorno" doc:description="Colas, filesystem ADLS, tamaño de micro-lote y retries del entorno activo"/>
+
+    <secure-properties:config name="Secure_Properties" file="secure-${env}.yaml" key="${mule.key}"
+        doc:name="Secure properties" doc:description="Secretos cifrados AES-CBC (Anypoint MQ y Service Principal de Entra ID)">
+        <secure-properties:encrypt algorithm="AES" mode="CBC"/>
+    </secure-properties:config>
+
+    <!-- ============ Anypoint MQ ============ -->
+    <anypoint-mq:config name="Anypoint_MQ_Config"
+        doc:name="Anypoint MQ" doc:description="Broker de entrega garantizada: colas por dominio, DLQ y cola de auditoría">
+        <anypoint-mq:connection url="${amq.url}"
+            clientId="${secure::amq.clientId}" clientSecret="${secure::amq.clientSecret}">
+            <reconnection>
+                <reconnect frequency="5000" count="10"/>
+            </reconnection>
+        </anypoint-mq:connection>
+    </anypoint-mq:config>
+
+    <!-- ============ Idempotencia (Object Store v2 en CloudHub 2.0) ============ -->
+    <os:object-store name="Idempotency_Store" persistent="true"
+        entryTtl="7" entryTtlUnit="DAYS" expirationInterval="1" expirationIntervalUnit="HOURS"
+        doc:name="Idempotency store" doc:description="Guarda cdcId procesados 7 días para descartar reentregas duplicadas"/>
+
+    <!-- ============ Azure Data Lake Storage Gen2 (OAuth 2.0 client credentials / Entra ID) ============ -->
+    <azure-data-lake-storage:config name="ADLS_Config"
+        doc:name="ADLS Gen2" doc:description="Cuenta ADLS Gen2 con namespace jerárquico; autentica con Service Principal de Entra ID">
+        <azure-data-lake-storage:oauth-2-0-connection baseUri="${adls.baseUri}">
+            <reconnection>
+                <reconnect frequency="5000" count="5"/>
+            </reconnection>
+            <azure-data-lake-storage:oauth-client-credentials
+                clientId="${secure::adls.clientId}"
+                clientSecret="${secure::adls.clientSecret}"
+                tokenUrl="${adls.tokenUrl}"
+                scopes="https://storage.azure.com/.default"/>
+        </azure-data-lake-storage:oauth-2-0-connection>
+    </azure-data-lake-storage:config>
+
+</mule>

@@ -1,0 +1,8 @@
+# Valores cifrados con el Secure Properties Tool (AES/CBC) usando -Dmule.key.
+# Formato: ![<valor cifrado>]. Reemplazar los marcadores antes de desplegar.
+amq:
+  clientId: "![REEMPLAZAR_CIFRADO]"
+  clientSecret: "![REEMPLAZAR_CIFRADO]"
+adls:
+  clientId: "![REEMPLAZAR_CIFRADO]"
+  clientSecret: "![REEMPLAZAR_CIFRADO]"

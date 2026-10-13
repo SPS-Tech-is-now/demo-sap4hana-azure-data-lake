@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sap-idoc-cdc: pruebas unitarias de la transformación IDoc → sobres CDC.
+  Los flujos con el SAP Connector requieren SAP JCo (sapjco3), que no se distribuye por Maven;
+  por eso aquí se prueba directamente el DataWeave con un IDoc DEBMAS07 de ejemplo.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="sap-idoc-cdc-smoke-test-suite.xml"/>
+
+    <munit:test name="debmas-maps-one-envelope-per-segment" description="DEBMAS07 con E1KNA1M + E1KNVVM produce 2 sobres (KNA1, KNVV) con DOCNUM como correlationId">
+        <munit:execution>
+            <set-payload value="#[readUrl('classpath://samples/debmas07.xml', 'application/xml')]" doc:name="IDoc DEBMAS07"/>
+            <ee:transform doc:name="IDoc a sobres CDC">
+                <ee:message><ee:set-payload resource="dw/idoc-to-cdc.dwl"/></ee:message>
+            </ee:transform>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[sizeOf(payload)]" is="#[MunitTools::equalTo(2)]"/>
+            <munit-tools:assert-that expression="#[payload[0].source.table]" is="#[MunitTools::equalTo('KNA1')]"/>
+            <munit-tools:assert-that expression="#[payload[0].key.KUNNR]" is="#[MunitTools::equalTo('0000100001')]"/>
+            <munit-tools:assert-that expression="#[payload[0].op]" is="#[MunitTools::equalTo('U')]"/>
+            <munit-tools:assert-that expression="#[payload[0].correlationId]" is="#[MunitTools::equalTo('0000000000004711')]"/>
+            <munit-tools:assert-that expression="#[payload[1].source.table]" is="#[MunitTools::equalTo('KNVV')]"/>
+            <munit-tools:assert-that expression="#[payload[1].key.VKORG]" is="#[MunitTools::equalTo('1000')]"/>
+            <munit-tools:assert-that expression="#[payload[1].key.KUNNR]" is="#[MunitTools::equalTo('0000100001')]"/>
+            <munit-tools:assert-that expression="#[payload[0].after.MSGFN]" is="#[MunitTools::nullValue()]"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

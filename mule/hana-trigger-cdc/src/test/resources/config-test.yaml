@@ -1,0 +1,19 @@
+# hana-trigger-cdc — configuración entorno DEV (Artes Gráficas) — requiere licencia HANA enterprise
+sap:
+  systemId: "ECC_PRD"
+  client: "300"
+
+hana:
+  url: "jdbc:sap://saphana.artesgraficas.local:30015/?databaseName=ECP&encrypt=true"
+  schema: "SAPABAP1"
+
+listener:
+  frequencyMs: "60000"
+  maxRows: "2000"
+
+amq:
+  url: "https://mq-us-east-1.anypoint.mulesoft.com/api/v1"
+  queue:
+    audit:    "cdc.audit"
+    ventas:   "cdc.q.ventas"
+    finanzas: "cdc.q.finanzas"

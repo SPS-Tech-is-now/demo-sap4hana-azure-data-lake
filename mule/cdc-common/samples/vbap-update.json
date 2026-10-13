@@ -1,0 +1,12 @@
+{
+  "cdcId": "6f1c2a7e-3b0d-4a8f-9a51-2f7d1c0e9b44",
+  "correlationId": "b1e0c6d2-58a4-4f1e-8d2c-7a9e3f61c0aa",
+  "source": { "system": "ECC_PRD", "client": "300", "mechanism": "ODP", "table": "VBAP" },
+  "op": "U",
+  "key": { "VBELN": "0000123456", "POSNR": "000010" },
+  "changeTs": "2026-10-13T15:02:11Z",
+  "seq": 884512,
+  "watermark": "ODQ:20261013150000.000123",
+  "before": null,
+  "after": { "MATNR": "PAP-COUCHE-150", "KWMENG": 1200, "NETWR": 18450.00 }
+}

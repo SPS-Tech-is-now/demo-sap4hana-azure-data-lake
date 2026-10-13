@@ -1,0 +1,31 @@
+# adls-delivery — configuración entorno DEV (Artes Gráficas)
+app:
+  name: "adls-delivery"
+
+sap:
+  systemId: "ECC_PRD"
+
+amq:
+  url: "https://mq-us-east-1.anypoint.mulesoft.com/api/v1"
+  ackTimeoutSeconds: "900"          # > periodo del lote + peor caso de reintentos por tabla
+  queue:
+    maestros:  "cdc.q.maestros"
+    ventas:    "cdc.q.ventas"
+    finanzas:  "cdc.q.finanzas"
+    catalogos: "cdc.q.catalogos"
+    dlq:       "cdc.dlq"            # además configurada como DLQ nativa de cada cola (maxDeliveries = 5)
+    audit:     "cdc.audit"
+
+adls:
+  baseUri:    "https://agdatalake.dfs.core.windows.net"
+  tokenUrl:   "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/oauth2/v2.0/token"   # reemplazar por el Tenant ID de Entra ID
+  fileSystem: "datalake"
+  rootPath:   "bronze/sap"
+
+batch:
+  periodSeconds: "3600"
+  maxSize: "5000"
+
+retry:
+  maxRetries: "5"
+  millisBetweenRetries: "10"

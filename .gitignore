@@ -1,0 +1,21 @@
+# Build / MUnit
+target/
+.mule/
+*.log
+
+# Flujo de la skill build-mule-integration
+tmp/
+
+# IDEs y SO
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Datos del cliente (volumetría SAP): no se publican en el repositorio
+*.xlsx
+
+# Llaves de cifrado / secretos locales
+*.key
+.env

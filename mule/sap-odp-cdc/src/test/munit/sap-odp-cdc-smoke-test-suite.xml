@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Smoke test de sap-odp-cdc: MUnit inicializa de forma lazy, por lo que se invoca CADA flujo
+  (con los conectores mockeados) para forzar la compilación de todas las expresiones
+  DataWeave y la validación de la configuración. Errores de ejecución por datos de prueba
+  se ignoran; un error de COMPILACIÓN hace fallar la prueba.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="sap-odp-cdc-smoke-test-suite.xml"/>
+
+    <munit:test name="sap-odp-cdc-all-flows-compile" description="Todos los flujos inicializan y sus expresiones DataWeave compilan">
+        <munit:behavior>
+            <munit-tools:mock-when processor="anypoint-mq:publish">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="os:store">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="os:retrieve">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <try doc:name="Inicializar odp-ventas-scheduler-flow">
+                <flow-ref name="odp-ventas-scheduler-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar odp-finanzas-scheduler-flow">
+                <flow-ref name="odp-finanzas-scheduler-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar pull-subscription-flow">
+                <flow-ref name="pull-subscription-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <try doc:name="Inicializar fetch-page-flow">
+                <flow-ref name="fetch-page-flow"/>
+                <error-handler><on-error-continue type="ANY"/></error-handler>
+            </try>
+            <set-payload value="#[app.name]" doc:name="Nombre de la app"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::notNullValue()]"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sap-initial-load — Carga histórica (~75 GB) con Batch Job, reanudable por partición
+
+  · Partición = tabla × sociedad (BUKRS) × ejercicio (GJAHR)  → ver partitions.json
+  · Ventana nocturna (cron) + maxConcurrency acotado = protección de SAP en horario hábil.
+  · Estado por partición en Object Store: si la app se detiene, el siguiente arranque
+    solo procesa particiones != DONE (reanuda donde se quedó, no desde cero).
+  · Publica el MISMO sobre CDC con op = R y seq = 0 → el consumidor no distingue carga
+    inicial de delta, y cualquier delta posterior a T0 gana en el MERGE.
+  · La app se apaga al terminar (no consume vCores permanentes).
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+      xmlns:sap="http://www.mulesoft.org/schema/mule/sap"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd
+        http://www.mulesoft.org/schema/mule/sap http://www.mulesoft.org/schema/mule/sap/current/mule-sap.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <flow name="initial-load-scheduler-flow" doc:name="Initial load (ventana nocturna)" doc:description="Cada noche a las 22:00 lanza el Batch Job con las particiones que aún no están DONE">
+        <scheduler doc:name="Ventana nocturna" doc:description="Cron de la ventana de carga (load.cron); fines de semana se amplía con un segundo cron">
+            <scheduling-strategy>
+                <cron expression="${load.cron}" timeZone="America/Mexico_City"/>
+            </scheduling-strategy>
+        </scheduler>
+
+        <set-variable variableName="runId" value="#[now() as String {format: &quot;yyyyMMddHHmmss&quot;}]" doc:name="Id de corrida" doc:description="Identifica la ventana de carga; forma parte de la semilla del cdcId de los registros op=R"/>
+        <ee:transform doc:name="Construir particiones" doc:description="Expande partitions.json en tabla × BUKRS × GJAHR">
+            <ee:message>
+                <ee:set-payload resource="dw/build-partitions.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable variableName="pending" value="#[[]]" doc:name="Pendientes" doc:description="Acumula las particiones cuyo estado no es DONE"/>
+        <foreach doc:name="Filtrar DONE" doc:description="Consulta el estado de cada partición en Object Store para reanudar sin repetir">
+            <os:retrieve key="#[payload.id]" objectStore="Partition_Store" target="state"
+                doc:name="Estado partición" doc:description="Lee el estado guardado; PENDING si nunca se ha procesado">
+                <os:default-value><![CDATA[#[{status: "PENDING"}]]]></os:default-value>
+            </os:retrieve>
+            <set-variable variableName="pending" value="#[if (vars.state.status != 'DONE') vars.pending + payload else vars.pending]"
+                doc:name="Agregar si pendiente" doc:description="Solo se reprocesan particiones PENDING, RUNNING (interrumpidas) o FAILED"/>
+        </foreach>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("LOAD_START", app.name, {pendingPartitions: sizeOf(vars.pending), t0: p("load.t0")})]'
+            doc:name="Log LOAD_START" doc:description="Registra cuántas particiones quedan pendientes en esta ventana"/>
+
+        <set-payload value="#[vars.pending]" doc:name="Particiones pendientes" doc:description="Entrada del Batch Job: una partición por registro"/>
+
+        <batch:job jobName="sap-initial-load-job" maxFailedRecords="-1" blockSize="1" maxConcurrency="${load.maxConcurrency}"
+            doc:name="Batch carga inicial" doc:description="Procesa una partición por registro con concurrencia limitada para no afectar a SAP">
+            <batch:process-records>
+                <batch:step name="extract-publish-step" doc:name="Extraer y publicar" doc:description="Lee la partición por páginas vía RFC y publica sobres op=R en Anypoint MQ">
+                    <set-variable variableName="partition" value="#[payload]" doc:name="Partición" doc:description="Tabla, sociedad, ejercicio, filtro y llaves de la partición"/>
+                    <os:store key="#[vars.partition.id]" objectStore="Partition_Store"
+                        doc:name="RUNNING" doc:description="Marca la partición en proceso (si la app cae, se reintenta en la siguiente ventana)">
+                        <os:value><![CDATA[#[{status: "RUNNING", startedAt: now()}]]]></os:value>
+                    </os:store>
+                    <set-variable variableName="offset" value="#[0]" doc:name="Offset 0" doc:description="Inicia la lectura paginada desde la primera fila"/>
+                    <set-variable variableName="morePages" value="#[true]" doc:name="Hay páginas" doc:description="Inicia el bucle de lectura paginada"/>
+                    <foreach collection="#[1 to (p('load.maxPages') as Number)]" doc:name="Páginas de la partición" doc:description="Bucle acotado (sin recursión) mientras la última página venga llena">
+                        <choice doc:name="¿Más páginas?" doc:description="Se detiene al recibir una página incompleta">
+                            <when expression="#[vars.morePages]" doc:name="Sí" doc:description="Lee la siguiente página">
+                                <flow-ref name="read-partition-page-flow" doc:name="Leer página" doc:description="RFC + publicación de una página de la partición"/>
+                            </when>
+                        </choice>
+                    </foreach>
+                    <os:store key="#[vars.partition.id]" objectStore="Partition_Store"
+                        doc:name="DONE" doc:description="Partición completa: no se vuelve a procesar en ventanas siguientes">
+                        <os:value><![CDATA[#[{status: "DONE", rows: vars.offset, finishedAt: now()}]]]></os:value>
+                    </os:store>
+                </batch:step>
+                <batch:step name="mark-failed-step" acceptPolicy="ONLY_FAILURES" doc:name="Marcar FAILED" doc:description="Registra particiones fallidas para reintentarlas en la siguiente ventana">
+                    <os:store key="#[payload.id]" objectStore="Partition_Store"
+                        doc:name="FAILED" doc:description="Marca la partición como fallida con la causa">
+                        <os:value><![CDATA[#[{status: "FAILED", failedAt: now()}]]]></os:value>
+                    </os:store>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <logger level="INFO" category="cdc.trace"
+                    message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("LOAD_REPORT", app.name, {total: payload.totalRecords, ok: payload.successfulRecords, failed: payload.failedRecords, elapsedMs: payload.elapsedTimeInMillis})]'
+                    doc:name="Reporte batch" doc:description="Reporte de la ventana: particiones procesadas, exitosas y fallidas"/>
+            </batch:on-complete>
+        </batch:job>
+    </flow>
+
+    <flow name="read-partition-page-flow" doc:name="Read partition page" doc:description="Lee UNA página de la partición vía Z_CDC_READ_TABLE, la publica e indica si hay más">
+        <until-successful maxRetries="${retry.maxRetries}" millisBetweenRetries="${retry.millisBetweenRetries}"
+            doc:name="Retry RFC" doc:description="Reintenta la lectura RFC si SAP está ocupado o hay timeout">
+            <sap:sync-rfc config-ref="SAP_Config" key="Z_CDC_READ_TABLE"
+                doc:name="Z_CDC_READ_TABLE" doc:description="Lee una página de la tabla con el filtro de la partición (RFC síncrono)">
+                <sap:content><![CDATA[#[%dw 2.0
+output application/xml
+---
+{
+    Z_CDC_READ_TABLE: {
+        "import": {
+            IV_TABLE:  vars.partition.table,
+            IV_WHERE:  vars.partition.filter,
+            IV_OFFSET: vars.offset,
+            IV_ROWS:   p("load.pageSize")
+        }
+    }
+}]]]></sap:content>
+            </sap:sync-rfc>
+        </until-successful>
+
+        <ee:transform doc:name="Página → sobres R" doc:description="Convierte las filas de la página en sobres CDC op=R con seq=0">
+            <ee:message>
+                <ee:set-payload resource="dw/rfc-page-to-cdc.dwl"/>
+            </ee:message>
+        </ee:transform>
+
+        <foreach doc:name="Publicar filas" doc:description="Publica cada fila de la página en la cola de su dominio">
+            <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="#[p('amq.queue.' ++ vars.partition.domain)]" messageId="#[payload.cdcId]"
+                doc:name="Publicar en MQ" doc:description="Publica el sobre op=R; adls-delivery lo aterriza igual que un delta">
+                <anypoint-mq:body><![CDATA[#[output application/json --- payload]]]></anypoint-mq:body>
+                <anypoint-mq:properties><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/java --- mqProperties(payload)]]]></anypoint-mq:properties>
+            </anypoint-mq:publish>
+        </foreach>
+
+        <set-variable variableName="pageRows" value="#[sizeOf(payload)]" doc:name="Filas de la página" doc:description="Número de filas leídas en esta página"/>
+        <set-variable variableName="offset" value="#[vars.offset + vars.pageRows]" doc:name="Avanzar offset" doc:description="Siguiente posición de lectura dentro de la partición"/>
+
+        <try doc:name="Auditoría best-effort" doc:description="Una falla de auditoría no debe revertir ni repetir la captura">
+            <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.audit}"
+            doc:name="Auditoría PUBLISHED" doc:description="Conteo de la página de carga inicial para la conciliación">
+            <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- stageEvent("PUBLISHED", app.name, {table: vars.partition.table, records: vars.pageRows, partition: vars.partition.id})]]]></anypoint-mq:body>
+        </anypoint-mq:publish>
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Ignorar falla de auditoría" doc:description="Registra la falla; la conciliación detectará el faltante">
+                    <logger level="WARN" category="cdc.trace" message="#['Auditoría no publicada: ' ++ (error.description default '')]" doc:name="Log auditoría fallida" doc:description="Advierte que el evento PUBLISHED no llegó a cdc.audit"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+
+        <set-variable variableName="morePages" value="#[vars.pageRows >= (p('load.pageSize') as Number)]" doc:name="¿Página llena?" doc:description="Si la página vino completa puede haber más filas en la partición"/>
+    </flow>
+
+    <flow name="resync-command-flow" maxConcurrency="1" doc:name="Resync command" doc:description="Atiende comandos POST /resync de cdc-control-api: recarga acotada de una partición con op=R">
+        <anypoint-mq:subscriber config-ref="Anypoint_MQ_Config" destination="${amq.queue.resync}" acknowledgementMode="IMMEDIATE"
+            doc:name="Subscriber cdc.cmd.resync" doc:description="ACK inmediato: una recarga de horas no se reentrega en paralelo; si falla, la conciliación la vuelve a solicitar"/>
+        <ee:transform doc:name="Comando → partición" doc:description="Construye la partición (tabla × sociedad × ejercicio) a partir del comando y de partitions.json">
+            <ee:variables>
+                <ee:set-variable variableName="partition"><![CDATA[%dw 2.0
+output application/java
+var cmd  = if (payload is String) read(payload, "application/json") else payload
+var plan = readUrl("classpath://partitions.json", "application/json")
+var t    = (plan.tables filter ($.table == cmd.table))[0]
+var c    = cmd.company default "ALL"
+var y    = cmd.year default "ALL"
+---
+if (t == null) null else {
+    id: t.table ++ "|" ++ c ++ "|" ++ y,
+    table: t.table,
+    domain: t.domain,
+    keys: t.keys,
+    company: c,
+    year: y,
+    filter: (
+        (if (c != "ALL" and t.byCompany != null) [t.byCompany ++ " = '" ++ c ++ "'"] else []) ++
+        (if (y != "ALL" and t.byYear != null) [t.byYear ++ " = '" ++ y ++ "'"] else [])
+    ) joinBy " AND "
+}]]></ee:set-variable>
+                <ee:set-variable variableName="offset"><![CDATA[%dw 2.0
+output application/java
+---
+0]]></ee:set-variable>
+                <ee:set-variable variableName="runId"><![CDATA[%dw 2.0
+output application/java
+---
+"resync-" ++ (now() as String {format: "yyyyMMddHHmmss"})]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <choice doc:name="¿Tabla conocida?" doc:description="Solo se recargan tablas definidas en partitions.json">
+            <when expression="#[vars.partition == null]" doc:name="Desconocida" doc:description="La tabla no está en el plan de particiones">
+                <logger level="WARN" category="cdc.trace" message="#['Resync ignorado: tabla no definida en partitions.json -> ' ++ write(payload, 'application/json')]"
+                    doc:name="Log ignorado" doc:description="Registra el comando descartado"/>
+            </when>
+            <otherwise doc:name="Recargar" doc:description="Ejecuta la lectura paginada de la partición solicitada">
+                <set-variable variableName="morePages" value="#[true]" doc:name="Hay páginas" doc:description="Inicia el bucle de lectura paginada"/>
+                    <foreach collection="#[1 to (p('load.maxPages') as Number)]" doc:name="Páginas de la partición" doc:description="Bucle acotado (sin recursión) mientras la última página venga llena">
+                        <choice doc:name="¿Más páginas?" doc:description="Se detiene al recibir una página incompleta">
+                            <when expression="#[vars.morePages]" doc:name="Sí" doc:description="Lee la siguiente página">
+                                <flow-ref name="read-partition-page-flow" doc:name="Leer página" doc:description="RFC + publicación de una página de la partición"/>
+                            </when>
+                        </choice>
+                    </foreach>
+                <logger level="INFO" category="cdc.trace"
+                    message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("RESYNC_DONE", app.name, {partition: vars.partition.id, rows: vars.offset})]'
+                    doc:name="Log RESYNC_DONE" doc:description="Registra la recarga completada y el número de filas"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+</mule>

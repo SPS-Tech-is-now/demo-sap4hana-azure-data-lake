@@ -1,0 +1,10 @@
+{
+  "_comment": "SLA de latencia (minutos) por tabla según dominio: maestros por evento, ventas 5 min, finanzas 15 min, catálogos diario. Incluye holgura de un ciclo.",
+  "defaultMinutes": 30,
+  "tables": {
+    "KNA1": 10, "KNVV": 10, "KNVP": 10, "LFA1": 10, "MARA": 10, "MAKT": 10, "MARM": 10, "MVKE": 10, "MBEW": 10,
+    "VBAK": 10, "VBAP": 10, "VBEP": 10, "VBRK": 10, "VBRP": 10, "EKKO": 10, "EKPO": 10, "AFKO": 10,
+    "BKPF": 30, "BSIS": 30, "BSID": 30, "GLPCA": 30, "COSP": 30, "MSEG": 30,
+    "T001": 1500, "TCURR": 1500, "T006A": 1500
+  }
+}

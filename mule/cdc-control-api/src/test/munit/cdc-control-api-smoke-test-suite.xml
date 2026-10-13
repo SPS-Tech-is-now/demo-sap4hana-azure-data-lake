@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Smoke test de cdc-control-api: MUnit inicializa de forma lazy, por lo que se invoca CADA flujo
+  (con los conectores mockeados) para forzar la compilación de todas las expresiones
+  DataWeave y la validación de la configuración. Errores de ejecución por datos de prueba
+  se ignoran; un error de COMPILACIÓN hace fallar la prueba.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <munit:config name="cdc-control-api-smoke-test-suite.xml"/>
+
+    <munit:test name="cdc-control-api-all-flows-compile" description="Todos los flujos inicializan y sus expresiones DataWeave compilan">
+        <munit:behavior>
+            <munit-tools:mock-when processor="anypoint-mq:publish"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:consume"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:ack"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:bulk-insert"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="azure-data-lake-storage:list-paths"><munit-tools:then-return/></munit-tools:mock-when>
+            <munit-tools:mock-when processor="azure-data-lake-storage:read-path"><munit-tools:then-return/></munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <try doc:name="main"><flow-ref name="cdc-control-api-main"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="trace"><flow-ref name="get:\trace\(correlationId):cdc-control-api-config"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="lag"><flow-ref name="get:\health\lag:cdc-control-api-config"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="reconcile"><flow-ref name="post:\reconcile:application\json:cdc-control-api-config"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="resync"><flow-ref name="post:\resync:application\json:cdc-control-api-config"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="replay"><flow-ref name="post:\dlq\replay:application\json:cdc-control-api-config"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="recon"><flow-ref name="reconcile-daily-flow"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <try doc:name="audit"><flow-ref name="audit-ingest-flow"/><error-handler><on-error-continue type="ANY"/></error-handler></try>
+            <set-payload value="#[app.name]" doc:name="Nombre de la app"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::notNullValue()]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="audit-rows-explode-committed-event" description="Un evento COMMITTED genera la fila resumen y una fila por correlationId">
+        <munit:execution>
+            <set-payload value='#[{ ts: "2026-10-13T15:05:00Z", app: "adls-delivery", stage: "COMMITTED", files: [ { table: "VBAP", path: "bronze/x.jsonl", count: 2, correlationIds: ["c-1", "c-2"] } ] }]'/>
+            <ee:transform>
+                <ee:message><ee:set-payload resource="dw/audit-rows.dwl"/></ee:message>
+            </ee:transform>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[sizeOf(payload)]" is="#[MunitTools::equalTo(3)]"/>
+            <munit-tools:assert-that expression="#[payload[0].records]" is="#[MunitTools::equalTo(2)]"/>
+            <munit-tools:assert-that expression="#[payload[1].correlationId]" is="#[MunitTools::equalTo('c-1')]"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

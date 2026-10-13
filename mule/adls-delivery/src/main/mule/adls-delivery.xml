@@ -1,0 +1,341 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  adls-delivery — Process layer del CDC SAP → Azure (Artes Gráficas)
+
+  Garantías que implementa:
+   1. Entrega garantizada : subscriber con ACK MANUAL; el ACK sale solo después del commit en ADLS.
+   2. Idempotencia        : cdcId determinista; se registra en Object Store SOLO tras el commit en ADLS
+                            (al recibir solo se consulta: una reentrega nunca se descarta sin estar en el lake).
+   3. Micro-batching      : time-based-aggregator (60 s o 5,000 registros) conservando ackTokens.
+   4. Commit atómico      : _tmp/<batch>.jsonl → rename a bronze/ → _manifest/<batch>.json.
+   5. Reintentos          : reconexión (nivel 1) · until-successful selectivo (nivel 2) ·
+                            NACK → redelivery MQ → DLQ (nivel 3) · replay vía cdc-control-api (nivel 4).
+   6. Trazabilidad        : log JSON por etapa + evento a cdc.audit con correlationId.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:aggregators="http://www.mulesoft.org/schema/mule/aggregators"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:azure-data-lake-storage="http://www.mulesoft.org/schema/mule/azure-data-lake-storage"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/aggregators http://www.mulesoft.org/schema/mule/aggregators/current/mule-aggregators.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/azure-data-lake-storage http://www.mulesoft.org/schema/mule/azure-data-lake-storage/current/mule-azure-data-lake-storage.xsd">
+
+    <!-- =====================================================================
+         1. INGESTA: una flow por cola de dominio, todas comparten la lógica
+         ===================================================================== -->
+    <flow name="subscribe-maestros-flow" doc:name="Subscribe maestros" doc:description="Consume cambios de datos maestros (IDoc) de cdc.q.maestros con ACK manual">
+        <anypoint-mq:subscriber config-ref="Anypoint_MQ_Config" destination="${amq.queue.maestros}"
+            acknowledgementMode="MANUAL" acknowledgementTimeout="${amq.ackTimeoutSeconds}" acknowledgementTimeoutUnit="SECONDS"
+            doc:name="Subscriber maestros" doc:description="Recibe sobres CDC de maestros; el mensaje queda in-flight hasta ACK/NACK explícito"/>
+        <flow-ref name="ingest-sub-flow" doc:name="Ingesta común" doc:description="Valida, deduplica y agrega el cambio al micro-lote"/>
+        <error-handler ref="ingest-error-handler"/>
+    </flow>
+
+    <flow name="subscribe-ventas-flow" doc:name="Subscribe ventas" doc:description="Consume cambios de ventas, compras y producción (ODP) de cdc.q.ventas con ACK manual">
+        <anypoint-mq:subscriber config-ref="Anypoint_MQ_Config" destination="${amq.queue.ventas}"
+            acknowledgementMode="MANUAL" acknowledgementTimeout="${amq.ackTimeoutSeconds}" acknowledgementTimeoutUnit="SECONDS"
+            doc:name="Subscriber ventas" doc:description="Recibe sobres CDC de ventas/compras; ACK solo tras commit en ADLS"/>
+        <flow-ref name="ingest-sub-flow" doc:name="Ingesta común" doc:description="Valida, deduplica y agrega el cambio al micro-lote"/>
+        <error-handler ref="ingest-error-handler"/>
+    </flow>
+
+    <flow name="subscribe-finanzas-flow" doc:name="Subscribe finanzas" doc:description="Consume cambios de finanzas, costos e inventario de cdc.q.finanzas con ACK manual">
+        <anypoint-mq:subscriber config-ref="Anypoint_MQ_Config" destination="${amq.queue.finanzas}"
+            acknowledgementMode="MANUAL" acknowledgementTimeout="${amq.ackTimeoutSeconds}" acknowledgementTimeoutUnit="SECONDS"
+            doc:name="Subscriber finanzas" doc:description="Recibe sobres CDC de GLPCA, BSIS, MSEG, COSP, BKPF y demás tablas financieras"/>
+        <flow-ref name="ingest-sub-flow" doc:name="Ingesta común" doc:description="Valida, deduplica y agrega el cambio al micro-lote"/>
+        <error-handler ref="ingest-error-handler"/>
+    </flow>
+
+    <flow name="subscribe-catalogos-flow" doc:name="Subscribe catálogos" doc:description="Consume snapshots diarios de catálogos (op=R) de cdc.q.catalogos con ACK manual">
+        <anypoint-mq:subscriber config-ref="Anypoint_MQ_Config" destination="${amq.queue.catalogos}"
+            acknowledgementMode="MANUAL" acknowledgementTimeout="${amq.ackTimeoutSeconds}" acknowledgementTimeoutUnit="SECONDS"
+            doc:name="Subscriber catálogos" doc:description="Recibe filas de catálogos T001, TVM*T, TCURR, etc. en modo refresh"/>
+        <flow-ref name="ingest-sub-flow" doc:name="Ingesta común" doc:description="Valida, deduplica y agrega el cambio al micro-lote"/>
+        <error-handler ref="ingest-error-handler"/>
+    </flow>
+
+    <sub-flow name="ingest-sub-flow" doc:name="Ingest sub-flow" doc:description="Valida el sobre CDC, descarta duplicados por cdcId y lo agrega al micro-lote con su ackToken">
+        <ee:transform doc:name="Contexto de traza" doc:description="Extrae ackToken y correlationId de las propiedades del mensaje MQ">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-payload>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="ackToken"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.ackToken]]></ee:set-variable>
+                <ee:set-variable variableName="correlationId"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.properties.correlationId default payload.correlationId default correlationId]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="¿Sobre válido?" doc:description="Rechaza sobres sin cdcId, tabla, llave u op válida (error no reintentable)">
+            <when expression="#[isEmpty(payload.cdcId) or isEmpty(payload.source.table) or isEmpty(payload.key) or not (['I','U','D','R'] contains payload.op)]"
+                doc:name="Inválido" doc:description="El sobre no cumple el contrato cdc-envelope.schema.json">
+                <raise-error type="APP:INVALID_ENVELOPE" description="El mensaje no cumple el contrato del sobre CDC"
+                    doc:name="Raise INVALID_ENVELOPE" doc:description="Envía el mensaje a la DLQ sin reintentos (no se arregla reintentando)"/>
+            </when>
+        </choice>
+
+        <set-variable variableName="envelope" value="#[payload]" doc:name="Guardar sobre" doc:description="Conserva el sobre CDC mientras se consulta el store"/>
+        <os:contains key="#[vars.envelope.cdcId]" objectStore="Idempotency_Store"
+            doc:name="¿Ya en el lake?" doc:description="Consulta si este cdcId ya fue COMPROMETIDO en ADLS (se registra solo tras el commit)"/>
+        <set-variable variableName="alreadyCommitted" value="#[payload as Boolean default false]" doc:name="Resultado" doc:description="true si el cambio ya está en el lake"/>
+        <set-payload value="#[vars.envelope]" doc:name="Restaurar sobre" doc:description="Recupera el sobre CDC para continuar la ingesta"/>
+        <choice doc:name="¿Duplicado?" doc:description="Un cdcId ya comprometido se confirma sin volver a escribirlo">
+            <when expression="#[vars.alreadyCommitted]" doc:name="Ya comprometido" doc:description="Reentrega de un cambio que ya está en el lake">
+                <raise-error type="APP:DUPLICATE" description="cdcId ya comprometido en ADLS"
+                    doc:name="Raise DUPLICATE" doc:description="Sale de la ingesta para confirmar (ACK) el duplicado"/>
+            </when>
+        </choice>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("RECEIVED", app.name, {correlationId: vars.correlationId, cdcId: payload.cdcId, table: payload.source.table, op: payload.op, seq: payload.seq})]'
+            doc:name="Log RECEIVED" doc:description="Log JSON estructurado de la etapa RECEIVED con correlationId y tabla"/>
+
+        <aggregators:time-based-aggregator name="cdcBatch" period="${batch.periodSeconds}" periodUnit="SECONDS" maxSize="${batch.maxSize}"
+            doc:name="Micro-lote" doc:description="Agrupa cambios por 60 s o 5,000 registros; conserva el ackToken de cada mensaje">
+            <aggregators:content><![CDATA[#[{
+                record: payload,
+                ackToken: vars.ackToken,
+                correlationId: vars.correlationId
+            }]]]></aggregators:content>
+        </aggregators:time-based-aggregator>
+    </sub-flow>
+
+    <error-handler name="ingest-error-handler">
+        <on-error-continue type="APP:DUPLICATE" doc:name="Duplicado" doc:description="Cambio ya entregado: se confirma (ACK) sin escribir de nuevo en el lake">
+            <logger level="INFO" category="cdc.trace"
+                message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("DUPLICATE", app.name, {correlationId: vars.correlationId, cdcId: payload.cdcId})]'
+                doc:name="Log DUPLICATE" doc:description="Registra el descarte idempotente del cambio duplicado"/>
+            <anypoint-mq:ack config-ref="Anypoint_MQ_Config" ackToken="#[vars.ackToken]"
+                doc:name="ACK duplicado" doc:description="Confirma el mensaje duplicado para que MQ no lo reentregue"/>
+        </on-error-continue>
+        <on-error-continue type="APP:INVALID_ENVELOPE, MULE:EXPRESSION, MULE:TRANSFORMATION" doc:name="No reintentable" doc:description="Mensaje corrupto: va a la DLQ con sobre de error y se confirma">
+            <flow-ref name="publish-dlq-sub-flow" doc:name="A DLQ" doc:description="Publica el mensaje original con su sobre de error en cdc.dlq"/>
+            <anypoint-mq:ack config-ref="Anypoint_MQ_Config" ackToken="#[vars.ackToken]"
+                doc:name="ACK tras DLQ" doc:description="Confirma el original una vez que quedó resguardado en la DLQ"/>
+        </on-error-continue>
+        <on-error-continue type="ANY" doc:name="Transitorio" doc:description="Falla transitoria (OS, MQ): NACK para que Anypoint MQ lo reentregue">
+            <anypoint-mq:nack config-ref="Anypoint_MQ_Config" ackToken="#[vars.ackToken]"
+                doc:name="NACK" doc:description="Devuelve el mensaje a la cola; tras maxDeliveries Anypoint MQ lo mueve a la DLQ"/>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- =====================================================================
+         2. COMMIT DEL MICRO-LOTE
+         ===================================================================== -->
+    <flow name="commit-batch-flow" doc:name="Commit batch" doc:description="Recibe el micro-lote y, POR TABLA, hace commit atómico en ADLS, registra los cdcId y confirma sus mensajes">
+        <aggregators:aggregator-listener aggregatorName="cdcBatch" includeTimedOutGroups="true"
+            doc:name="Micro-lote listo" doc:description="Se dispara cuando el micro-lote cumple 60 s o 5,000 registros"/>
+
+        <ee:transform doc:name="Agrupar por tabla" doc:description="Arma un archivo JSON Lines por tabla con conteo, seq min/max, cdcIds y sus ackTokens">
+            <ee:message>
+                <ee:set-payload resource="dw/batch-files.dwl"/>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="committedFiles" value="#[[]]" doc:name="Comprometidos" doc:description="Archivos comprometidos en este lote (para auditoría)"/>
+
+        <foreach collection="#[payload]" doc:name="Por cada tabla" doc:description="Cada tabla es una unidad de commit independiente: su éxito o falla no afecta a las demás">
+            <set-variable variableName="file" value="#[payload]" doc:name="Archivo actual" doc:description="Tabla, rutas, contenido, cdcIds y ackTokens del archivo"/>
+            <try doc:name="Commit + ACK de la tabla" doc:description="Commit atómico; luego registra los cdcId y confirma solo los mensajes de esta tabla">
+                <flow-ref name="adls-commit-sub-flow" doc:name="Commit ADLS" doc:description="_tmp → rename a bronze → manifest"/>
+                <foreach collection="#[vars.file.cdcIds]" doc:name="Registrar cdcIds" doc:description="Marca cada cdcId como comprometido (TTL 7 días) ANTES del ACK">
+                    <os:store key="#[payload]" objectStore="Idempotency_Store" doc:name="cdcId comprometido" doc:description="Si la app cae antes del ACK, la reentrega se reconoce como duplicado ya aterrizado">
+                        <os:value><![CDATA[#[true]]]></os:value>
+                    </os:store>
+                </foreach>
+                <foreach collection="#[vars.file.ackTokens]" doc:name="ACK por mensaje" doc:description="Confirma cada mensaje de la tabla ya persistido en el lake">
+                    <anypoint-mq:ack config-ref="Anypoint_MQ_Config" ackToken="#[payload]"
+                        doc:name="ACK" doc:description="Confirma el mensaje en Anypoint MQ: el cambio ya está comprometido en ADLS"/>
+                </foreach>
+                <set-variable variableName="committedFiles" value="#[vars.committedFiles + (vars.file -- ['content', 'records', 'ackTokens', 'cdcIds'])]"
+                    doc:name="Agregar a comprometidos" doc:description="Registra el archivo para el evento de auditoría COMMITTED"/>
+                <error-handler>
+                    <on-error-continue type="APP:NON_RETRYABLE" doc:name="Tabla no reintentable" doc:description="ADLS rechazó el contenido (4xx): sus registros van a la DLQ y se confirman">
+                        <flow-ref name="file-to-dlq-sub-flow" doc:name="Tabla a DLQ" doc:description="Resguarda cada registro de la tabla en la DLQ con su sobre de error"/>
+                    </on-error-continue>
+                    <on-error-continue type="ANY" doc:name="Tabla transitoria" doc:description="Reintentos agotados: NACK de los mensajes de esta tabla para que MQ los reentregue">
+                        <logger level="WARN" category="cdc.trace"
+                            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("NACK", app.name, {table: vars.file.table, error: error.errorType.identifier, description: error.description, messages: sizeOf(vars.file.ackTokens default [])})]'
+                            doc:name="Log NACK" doc:description="Registra el NACK de la tabla y la causa"/>
+                        <foreach collection="#[vars.file.ackTokens]" doc:name="NACK por mensaje" doc:description="Devuelve cada mensaje de la tabla a su cola para reentrega">
+                            <try doc:name="NACK seguro" doc:description="Un token ya confirmado o expirado no debe interrumpir el resto">
+                                <anypoint-mq:nack config-ref="Anypoint_MQ_Config" ackToken="#[payload]"
+                                    doc:name="NACK" doc:description="Reentrega; tras maxDeliveries=5 Anypoint MQ lo mueve a cdc.dlq"/>
+                                <error-handler>
+                                    <on-error-continue type="ANY" doc:name="Ignorar NACK fallido" doc:description="Si el NACK falla, el ack timeout de MQ reentrega el mensaje de todas formas"/>
+                                </error-handler>
+                            </try>
+                        </foreach>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </foreach>
+
+        <choice doc:name="¿Hubo commits?" doc:description="Solo audita si al menos una tabla quedó comprometida">
+            <when expression="#[not isEmpty(vars.committedFiles)]" doc:name="Sí" doc:description="Publica el evento COMMITTED">
+                <try doc:name="Auditoría best-effort" doc:description="Una falla de auditoría no afecta mensajes ya confirmados">
+                    <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.audit}"
+                        doc:name="Auditoría COMMITTED" doc:description="Publica evento de auditoría con conteos por tabla para cdc-control-api">
+                        <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- stageEvent("COMMITTED", app.name, {
+                            files: vars.committedFiles map { table: $.table, path: $.finalPath, count: $.count, minSeq: $.minSeq, maxSeq: $.maxSeq, correlationIds: $.correlationIds }
+                        })]]]></anypoint-mq:body>
+                    </anypoint-mq:publish>
+                    <error-handler>
+                        <on-error-continue type="ANY" doc:name="Ignorar falla de auditoría" doc:description="La conciliación detectará el faltante de auditoría">
+                            <logger level="WARN" category="cdc.trace" message="#['Auditoría COMMITTED no publicada: ' ++ (error.description default '')]" doc:name="Log auditoría fallida" doc:description="Advierte que el evento no llegó a cdc.audit"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- =====================================================================
+         3. COMMIT ATÓMICO EN ADLS GEN2 (un archivo)
+         ===================================================================== -->
+    <sub-flow name="adls-commit-sub-flow" doc:name="ADLS commit" doc:description="Escribe en _tmp, renombra atómicamente a bronze y publica el manifiesto del archivo">
+        <flow-ref name="adls-write-tmp-sub-flow" doc:name="Escribir _tmp" doc:description="create + append + flush del JSON Lines en _tmp/ con retry selectivo"/>
+        <flow-ref name="adls-rename-sub-flow" doc:name="Rename atómico" doc:description="Mueve _tmp/ a bronze/ en una sola operación (HNS)"/>
+        <flow-ref name="adls-write-manifest-sub-flow" doc:name="Escribir manifiesto" doc:description="Publica _manifest/: el consumidor solo procesa archivos con manifiesto"/>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("LANDED", app.name, {table: vars.file.table, path: vars.file.finalPath, count: vars.file.count, minSeq: vars.file.minSeq, maxSeq: vars.file.maxSeq, sha256: vars.file.sha256})]'
+            doc:name="Log LANDED" doc:description="Log JSON de archivo comprometido en bronze con su manifiesto"/>
+    </sub-flow>
+
+    <sub-flow name="adls-write-tmp-sub-flow" doc:name="Write tmp" doc:description="Escribe el archivo en _tmp/ con reintentos solo ante errores transitorios">
+        <until-successful maxRetries="${retry.maxRetries}" millisBetweenRetries="${retry.millisBetweenRetries}"
+            doc:name="Retry _tmp" doc:description="Nivel 2 de reintento: reintenta 429/503/timeout/conectividad de ADLS">
+            <try doc:name="Write _tmp" doc:description="Clasifica errores: transitorios se propagan (retry), 4xx se marcan como no reintentables">
+                <azure-data-lake-storage:create-or-rename config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.tmpPath]" resource="file"
+                    doc:name="Crear _tmp" doc:description="Crea (o sobreescribe) el archivo temporal _tmp/batchId.jsonl"/>
+                <azure-data-lake-storage:update-path config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.tmpPath]"
+                    action="append" position="0" contentLength="#[vars.file.bytes]"
+                    doc:name="Append contenido" doc:description="Sube el contenido JSON Lines del lote para esta tabla">
+                    <azure-data-lake-storage:content><![CDATA[#[vars.file.content]]]></azure-data-lake-storage:content>
+                </azure-data-lake-storage:update-path>
+                <azure-data-lake-storage:update-path config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.tmpPath]"
+                    action="flush" position="#[vars.file.bytes]" contentLength="0" close="true"
+                    doc:name="Flush" doc:description="Confirma los bytes escritos en el archivo temporal"/>
+                <error-handler ref="adls-selective-retry-handler"/>
+            </try>
+        </until-successful>
+        <flow-ref name="raise-if-fatal-sub-flow" doc:name="¿Error fatal?" doc:description="Si hubo un 4xx, detiene el commit como APP:NON_RETRYABLE"/>
+    </sub-flow>
+
+    <sub-flow name="adls-rename-sub-flow" doc:name="Rename" doc:description="Renombra _tmp a la ruta final bronze; el rename es atómico con namespace jerárquico">
+        <until-successful maxRetries="${retry.maxRetries}" millisBetweenRetries="${retry.millisBetweenRetries}"
+            doc:name="Retry rename" doc:description="Reintenta el rename ante errores transitorios de ADLS">
+            <try doc:name="Rename" doc:description="Mueve el archivo; un NOT_FOUND tras un reintento indica que el rename ya ocurrió">
+                <azure-data-lake-storage:create-or-rename config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.finalPath]"
+                    xMsRenameSource="#['/' ++ p('adls.fileSystem') ++ '/' ++ vars.file.tmpPath]"
+                    doc:name="Rename a bronze" doc:description="Rename atómico _tmp/ → bronze/sap/ecc_prd/tabla/yyyy=/mm=/dd=/"/>
+                <error-handler>
+                    <on-error-continue type="AZURE-DATA-LAKE-STORAGE:NOT_FOUND" doc:name="Ya renombrado" doc:description="Idempotencia del rename: el origen ya no existe porque el intento previo sí renombró">
+                        <azure-data-lake-storage:get-path-properties config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.finalPath]"
+                            doc:name="Verificar destino" doc:description="Confirma que el archivo final existe; si no existe, el error se propaga"/>
+                    </on-error-continue>
+                    <on-error-propagate type="AZURE-DATA-LAKE-STORAGE:TOO_MANY_REQUESTS, AZURE-DATA-LAKE-STORAGE:SERVICE_UNAVAILABLE, AZURE-DATA-LAKE-STORAGE:TIMEOUT, AZURE-DATA-LAKE-STORAGE:CONNECTIVITY, AZURE-DATA-LAKE-STORAGE:INTERNAL_SERVER_ERROR, AZURE-DATA-LAKE-STORAGE:SERVER_ERROR, MULE:CONNECTIVITY"
+                        doc:name="Transitorio" doc:description="Propaga para que until-successful reintente"/>
+                </error-handler>
+            </try>
+        </until-successful>
+    </sub-flow>
+
+    <sub-flow name="adls-write-manifest-sub-flow" doc:name="Write manifest" doc:description="Escribe el manifiesto JSON del archivo comprometido (conteo, seq, sha256, correlationIds)">
+        <ee:transform doc:name="Construir manifiesto" doc:description="Genera el JSON del manifiesto y su tamaño en bytes">
+            <ee:variables>
+                <ee:set-variable resource="dw/manifest.dwl" variableName="manifest"/>
+            </ee:variables>
+        </ee:transform>
+        <until-successful maxRetries="${retry.maxRetries}" millisBetweenRetries="${retry.millisBetweenRetries}"
+            doc:name="Retry manifest" doc:description="Reintenta la escritura del manifiesto ante errores transitorios">
+            <try doc:name="Write manifest" doc:description="create + append + flush del manifiesto; el manifiesto es el commit lógico">
+                <azure-data-lake-storage:create-or-rename config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.manifestPath]" resource="file"
+                    doc:name="Crear manifiesto" doc:description="Crea _manifest/tabla/yyyy=/mm=/dd=/batchId.json"/>
+                <azure-data-lake-storage:update-path config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.manifestPath]"
+                    action="append" position="0" contentLength="#[vars.manifest.bytes]"
+                    doc:name="Append manifiesto" doc:description="Escribe el contenido del manifiesto">
+                    <azure-data-lake-storage:content><![CDATA[#[vars.manifest.content]]]></azure-data-lake-storage:content>
+                </azure-data-lake-storage:update-path>
+                <azure-data-lake-storage:update-path config-ref="ADLS_Config" fileSystem="${adls.fileSystem}" path="#[vars.file.manifestPath]"
+                    action="flush" position="#[vars.manifest.bytes]" contentLength="0" close="true"
+                    doc:name="Flush manifiesto" doc:description="Confirma el manifiesto: a partir de aquí el archivo es visible para consumidores"/>
+                <error-handler ref="adls-selective-retry-handler"/>
+            </try>
+        </until-successful>
+        <flow-ref name="raise-if-fatal-sub-flow" doc:name="¿Error fatal?" doc:description="Si hubo un 4xx, detiene el commit como APP:NON_RETRYABLE"/>
+    </sub-flow>
+
+    <!-- Reintento SELECTIVO: transitorios se propagan (until-successful reintenta);
+         4xx se capturan, se marcan y se convierten en APP:NON_RETRYABLE fuera del retry. -->
+    <error-handler name="adls-selective-retry-handler">
+        <on-error-propagate type="AZURE-DATA-LAKE-STORAGE:TOO_MANY_REQUESTS, AZURE-DATA-LAKE-STORAGE:SERVICE_UNAVAILABLE, AZURE-DATA-LAKE-STORAGE:TIMEOUT, AZURE-DATA-LAKE-STORAGE:CONNECTIVITY, AZURE-DATA-LAKE-STORAGE:INTERNAL_SERVER_ERROR, AZURE-DATA-LAKE-STORAGE:SERVER_ERROR, MULE:CONNECTIVITY"
+            doc:name="Transitorio" doc:description="429/503/timeout/conectividad: se propaga para que until-successful reintente">
+            <logger level="WARN" category="cdc.trace"
+                message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("RETRY", app.name, {table: vars.file.table, error: error.errorType.identifier})]'
+                doc:name="Log RETRY" doc:description="Registra cada intento fallido transitorio"/>
+        </on-error-propagate>
+        <on-error-continue type="ANY" doc:name="No reintentable" doc:description="4xx u otro error permanente: marca fatal y sale del retry sin reintentar">
+            <set-variable variableName="fatalError" value="#[{errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"
+                doc:name="Marcar fatal" doc:description="Guarda la causa para convertirla en APP:NON_RETRYABLE"/>
+        </on-error-continue>
+    </error-handler>
+
+    <sub-flow name="raise-if-fatal-sub-flow" doc:name="Raise if fatal" doc:description="Convierte un error permanente marcado dentro del retry en APP:NON_RETRYABLE">
+        <choice doc:name="¿fatalError?" doc:description="Evalúa si el bloque de retry terminó por un error no reintentable">
+            <when expression="#[vars.fatalError != null]" doc:name="Fatal" doc:description="Hubo error permanente (4xx)">
+                <logger level="ERROR" category="cdc.trace"
+                    message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("FATAL", app.name, {table: vars.file.table, error: vars.fatalError})]'
+                    doc:name="Log FATAL" doc:description="Registra la causa del error permanente de ADLS antes de escalarlo"/>
+                <raise-error type="APP:NON_RETRYABLE" description="ADLS rechazó la operación con un error no reintentable (4xx)"
+                    doc:name="Raise NON_RETRYABLE" doc:description="Escala el error para enviar el lote a la DLQ"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- =====================================================================
+         4. DLQ
+         ===================================================================== -->
+    <sub-flow name="publish-dlq-sub-flow" doc:name="Publish DLQ" doc:description="Publica el mensaje original envuelto en el sobre de error en cdc.dlq">
+        <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.dlq}"
+            doc:name="Publicar en DLQ" doc:description="Resguarda el mensaje para análisis y replay vía cdc-control-api">
+            <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- errorEnvelope(error, payload, "adls-delivery.ingest", app.name)]]]></anypoint-mq:body>
+            <anypoint-mq:properties><![CDATA[#[{correlationId: vars.correlationId default "", errorType: error.errorType.identifier default ""}]]]></anypoint-mq:properties>
+        </anypoint-mq:publish>
+        <logger level="ERROR" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("DLQ", app.name, {correlationId: vars.correlationId, error: error.errorType.identifier, description: error.description})]'
+            doc:name="Log DLQ" doc:description="Registra el envío a DLQ; dispara alerta en Anypoint Monitoring"/>
+    </sub-flow>
+
+    <sub-flow name="file-to-dlq-sub-flow" doc:name="File to DLQ" doc:description="Envía cada registro de una tabla rechazada por ADLS a la DLQ y confirma sus mensajes">
+        <set-variable variableName="fileError" value="#[error]" doc:name="Guardar error" doc:description="Conserva el error para el sobre de error de cada registro"/>
+        <foreach collection="#[vars.file.records]" doc:name="Por registro" doc:description="Itera los registros de la tabla rechazada">
+            <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.dlq}"
+                doc:name="Registro a DLQ" doc:description="Publica el registro con el sobre de error">
+                <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- errorEnvelope(vars.fileError, payload, "adls-delivery.commit", app.name)]]]></anypoint-mq:body>
+                <anypoint-mq:properties><![CDATA[#[{correlationId: payload.correlationId default ""}]]]></anypoint-mq:properties>
+            </anypoint-mq:publish>
+        </foreach>
+        <foreach collection="#[vars.file.ackTokens]" doc:name="ACK tabla DLQ" doc:description="Confirma los mensajes originales ya resguardados en la DLQ">
+            <anypoint-mq:ack config-ref="Anypoint_MQ_Config" ackToken="#[payload]"
+                doc:name="ACK" doc:description="Confirma el mensaje original"/>
+        </foreach>
+    </sub-flow>
+
+</mule>

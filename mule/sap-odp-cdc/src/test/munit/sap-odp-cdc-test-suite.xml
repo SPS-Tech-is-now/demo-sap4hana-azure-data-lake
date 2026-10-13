@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pruebas de la garantía "el delta token solo avanza tras publicar TODO" (sap-odp-cdc).
+   1. Última página con __delta  → se publican las filas y se guarda el nuevo token.
+   2. SAP Gateway falla (4xx)    → no se publica nada y el token NO avanza (se repetirá el delta).
+   3. Gateway 503 persistente    → reintentos y el token NO avanza.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="sap-odp-cdc-test-suite.xml"/>
+
+    <sub-flow name="given-vbap-subscription">
+        <set-variable variableName="domain" value="ventas"/>
+        <set-variable variableName="sub" value='#[{ name: "ZODP_VBAP", service: "ZODP_SD_SRV", entitySet: "FactsOfZVBAP", table: "VBAP", keys: ["VBELN", "POSNR"] }]'/>
+    </sub-flow>
+
+    <munit:test name="last-page-publishes-rows-and-advances-token" description="Página final con __delta: publica 3 filas (C/U/D) y guarda el nuevo delta token">
+        <munit:behavior>
+            <munit-tools:mock-when processor="os:retrieve">
+                <munit-tools:then-return><munit-tools:payload value='#["https://sapgw/ZODP_SD_SRV/FactsOfZVBAP?!deltatoken=OLD"]'/></munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:then-return>
+                    <munit-tools:payload mediaType="application/json" value='#[output application/json --- { d: {
+                        results: [
+                            { VBELN: "0000123456", POSNR: "000010", NETWR: 100, ODQ_CHANGEMODE: "C" },
+                            { VBELN: "0000123456", POSNR: "000020", NETWR: 250, ODQ_CHANGEMODE: "U" },
+                            { VBELN: "0000123400", POSNR: "000010", NETWR: 0,   ODQ_CHANGEMODE: "D" }
+                        ],
+                        "__delta": "https://sapgw/ZODP_SD_SRV/FactsOfZVBAP?!deltatoken=NEW"
+                    } }]'/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="anypoint-mq:publish">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="os:store">
+                <munit-tools:then-return/>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="given-vbap-subscription"/>
+            <flow-ref name="pull-subscription-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <!-- 3 sobres a cdc.q.ventas + 1 evento de auditoría -->
+            <munit-tools:verify-call processor="anypoint-mq:publish" times="3">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="destination" whereValue="cdc.q.ventas"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <munit-tools:verify-call processor="os:store" times="1"/>
+            <munit-tools:assert-that expression="#[vars.newDelta]" is="#[MunitTools::equalTo('https://sapgw/ZODP_SD_SRV/FactsOfZVBAP?!deltatoken=NEW')]"/>
+            <munit-tools:assert-that expression="#[vars.published]" is="#[MunitTools::equalTo(3)]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="gateway-4xx-does-not-advance-token" description="Error permanente del Gateway: sin publicaciones y sin avanzar el delta token">
+        <munit:behavior>
+            <munit-tools:mock-when processor="os:retrieve">
+                <munit-tools:then-return><munit-tools:payload value='#["https://sapgw/ZODP_SD_SRV/FactsOfZVBAP?!deltatoken=OLD"]'/></munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:then-return><munit-tools:error typeId="HTTP:FORBIDDEN"/></munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="given-vbap-subscription"/>
+            <flow-ref name="pull-subscription-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="http:request" times="1"/>
+            <munit-tools:verify-call processor="anypoint-mq:publish" times="0"/>
+            <munit-tools:verify-call processor="os:store" times="0"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="gateway-503-retries-and-does-not-advance-token" description="Gateway 503 persistente: 1 intento + 5 reintentos y el token no avanza">
+        <munit:behavior>
+            <munit-tools:mock-when processor="os:retrieve">
+                <munit-tools:then-return><munit-tools:payload value='#["https://sapgw/ZODP_SD_SRV/FactsOfZVBAP?!deltatoken=OLD"]'/></munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:then-return><munit-tools:error typeId="HTTP:SERVICE_UNAVAILABLE"/></munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="given-vbap-subscription"/>
+            <flow-ref name="pull-subscription-flow"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="http:request" times="6"/>
+            <munit-tools:verify-call processor="anypoint-mq:publish" times="0"/>
+            <munit-tools:verify-call processor="os:store" times="0"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>

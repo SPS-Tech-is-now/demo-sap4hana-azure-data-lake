@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sap-odp-cdc — System layer de captura ODP (SAP ECC on HANA → Anypoint MQ)
+
+  Patrón de entrega garantizada:
+    · Lee el delta ODP vía OData (canal permitido por SAP Note 3255746) página por página.
+    · Publica cada fila como sobre CDC en la cola del dominio.
+    · El nuevo delta token (__delta) se guarda en Object Store SOLO después de publicar
+      todas las páginas. Si algo falla a mitad, el token no avanza y el siguiente ciclo
+      repite el mismo delta link (ODQ lo trata como repetición) → cero pérdida.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!-- =============== Disparadores por dominio (latencia mixta) =============== -->
+    <flow name="odp-ventas-scheduler-flow" doc:name="ODP ventas (5 min)" doc:description="Cada 5 minutos extrae los deltas ODP de ventas, compras y producción">
+        <scheduler doc:name="Cada 5 min" doc:description="Frecuencia de ventas/compras definida en schedule.ventasMs (300,000 ms)">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${schedule.ventasMs}" startDelay="10000"/>
+            </scheduling-strategy>
+        </scheduler>
+        <set-variable variableName="domain" value="ventas" doc:name="Dominio ventas" doc:description="Selecciona las suscripciones ODP del dominio ventas"/>
+        <flow-ref name="process-domain-sub-flow" doc:name="Procesar dominio" doc:description="Recorre las suscripciones del dominio y extrae su delta"/>
+    </flow>
+
+    <flow name="odp-finanzas-scheduler-flow" doc:name="ODP finanzas (15 min)" doc:description="Cada 15 minutos extrae los deltas ODP de finanzas, costos e inventario">
+        <scheduler doc:name="Cada 15 min" doc:description="Frecuencia de finanzas definida en schedule.finanzasMs (900,000 ms)">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${schedule.finanzasMs}" startDelay="20000"/>
+            </scheduling-strategy>
+        </scheduler>
+        <set-variable variableName="domain" value="finanzas" doc:name="Dominio finanzas" doc:description="Selecciona las suscripciones ODP del dominio finanzas"/>
+        <flow-ref name="process-domain-sub-flow" doc:name="Procesar dominio" doc:description="Recorre las suscripciones del dominio y extrae su delta"/>
+    </flow>
+
+    <sub-flow name="process-domain-sub-flow" doc:name="Process domain" doc:description="Itera las suscripciones ODP del dominio; una falla no detiene a las demás">
+        <ee:transform doc:name="Suscripciones" doc:description="Carga subscriptions.json y filtra las del dominio actual">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+readUrl("classpath://subscriptions.json", "application/json")[vars.domain] default []]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <foreach doc:name="Por suscripción" doc:description="Extrae el delta de cada suscripción ODP del dominio">
+            <set-variable variableName="sub" value="#[payload]" doc:name="Suscripción actual" doc:description="Nombre ODP, servicio OData, entity set, tabla SAP y llaves"/>
+            <flow-ref name="pull-subscription-flow" doc:name="Extraer delta" doc:description="Lee todas las páginas del delta y avanza el token al final"/>
+        </foreach>
+    </sub-flow>
+
+    <!-- =============== Extracción de una suscripción =============== -->
+    <flow name="pull-subscription-flow" doc:name="Pull subscription" doc:description="Lee el delta ODP de una suscripción, publica cada fila y confirma el delta token al final">
+        <os:retrieve key="#[vars.sub.name]" objectStore="Watermark_Store"
+            doc:name="Leer delta token" doc:description="Recupera el último delta link confirmado para esta suscripción ODP">
+            <os:default-value><![CDATA[#[""]]]></os:default-value>
+        </os:retrieve>
+
+        <ee:transform doc:name="Preparar extracción" doc:description="Primera vez: URL de inicialización con track-changes; luego: el delta link guardado">
+            <ee:variables>
+                <ee:set-variable variableName="watermark"><![CDATA[%dw 2.0
+output application/java
+---
+if (isEmpty(payload)) "INIT" else payload]]></ee:set-variable>
+                <ee:set-variable variableName="nextUrl"><![CDATA[%dw 2.0
+output application/java
+---
+if (isEmpty(payload))
+    Mule::p("sap.gateway.baseUrl") ++ "/" ++ vars.sub.service ++ "/" ++ vars.sub.entitySet ++ "?\$format=json"
+else payload]]></ee:set-variable>
+                <ee:set-variable variableName="published"><![CDATA[%dw 2.0
+output application/java
+---
+0]]></ee:set-variable>
+                <ee:set-variable variableName="pages"><![CDATA[%dw 2.0
+output application/java
+---
+0]]></ee:set-variable>
+                <ee:set-variable variableName="seqBase"><![CDATA[%dw 2.0
+output application/java
+---
+(now() as Number {unit: "milliseconds"}) * 1000]]></ee:set-variable>
+                <ee:set-variable variableName="newDelta"><![CDATA[%dw 2.0
+output application/java
+---
+null]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <foreach collection="#[1 to (p('sap.gateway.maxPages') as Number)]" doc:name="Páginas del delta" doc:description="Bucle acotado (sin recursión): lee páginas mientras ODP devuelva __next">
+            <choice doc:name="¿Hay página pendiente?" doc:description="Se detiene cuando la última página ya entregó __delta">
+                <when expression="#[vars.nextUrl != null]" doc:name="Sí" doc:description="Lee y publica la siguiente página">
+                    <flow-ref name="fetch-page-flow" doc:name="Leer página" doc:description="GET + publicación de una página del delta"/>
+                </when>
+            </choice>
+        </foreach>
+
+        <choice doc:name="¿Delta recibido?" doc:description="Solo avanza el token si ODP entregó un nuevo __delta al final de la última página">
+            <when expression="#[not isEmpty(vars.newDelta)]" doc:name="Sí" doc:description="Todas las páginas se publicaron: confirmar el nuevo delta token">
+                <os:store key="#[vars.sub.name]" objectStore="Watermark_Store"
+                    doc:name="Confirmar delta token" doc:description="Avanza el watermark SOLO después de publicar todas las páginas en MQ">
+                    <os:value><![CDATA[#[vars.newDelta]]]></os:value>
+                </os:store>
+            </when>
+            <otherwise doc:name="No" doc:description="Sin __delta: se conserva el token anterior y se reintenta en el siguiente ciclo">
+                <logger level="WARN" category="cdc.trace" message="#['ODP ' ++ vars.sub.name ++ ': respuesta sin __delta, el token no avanza']"
+                    doc:name="Log sin delta" doc:description="Advierte que el delta token no se avanzó en este ciclo"/>
+            </otherwise>
+        </choice>
+
+        <logger level="INFO" category="cdc.trace"
+            message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("PUBLISHED", app.name, {subscription: vars.sub.name, table: vars.sub.table, pages: vars.pages, records: vars.published, tokenAdvanced: not isEmpty(vars.newDelta)})]'
+            doc:name="Log PUBLISHED" doc:description="Resumen JSON de la extracción: páginas, registros publicados y avance del token"/>
+
+        <choice doc:name="¿Hubo cambios?" doc:description="Solo audita extracciones con registros publicados">
+            <when expression="#[vars.published > 0]" doc:name="Sí" doc:description="Publica el conteo capturado para la conciliación">
+                <try doc:name="Auditoría best-effort" doc:description="Una falla de auditoría no debe revertir ni repetir la captura">
+                    <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="${amq.queue.audit}"
+            doc:name="Auditoría PUBLISHED" doc:description="Conteo capturado por tabla para la conciliación capturado vs. aterrizado">
+            <anypoint-mq:body><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/json --- stageEvent("PUBLISHED", app.name, {table: vars.sub.table, records: vars.published, subscription: vars.sub.name})]]]></anypoint-mq:body>
+        </anypoint-mq:publish>
+                    <error-handler>
+                        <on-error-continue type="ANY" doc:name="Ignorar falla de auditoría" doc:description="Registra la falla; la conciliación detectará el faltante">
+                            <logger level="WARN" category="cdc.trace" message="#['Auditoría no publicada: ' ++ (error.description default '')]" doc:name="Log auditoría fallida" doc:description="Advierte que el evento PUBLISHED no llegó a cdc.audit"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </when>
+        </choice>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Falla de suscripción" doc:description="El token NO avanza; el siguiente ciclo repite el mismo delta link sin perder cambios">
+                <logger level="ERROR" category="cdc.trace"
+                    message='#[%dw 2.0 import * from dw::cdc::Envelope output application/json indent=false --- stageEvent("CAPTURE_FAILED", app.name, {subscription: vars.sub.name, table: vars.sub.table, pagesPublished: vars.pages, error: error.errorType.identifier, description: error.description})]'
+                    doc:name="Log CAPTURE_FAILED" doc:description="Registra la falla; Anypoint Monitoring alerta y el delta se repetirá"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="fetch-page-flow" doc:name="Fetch page" doc:description="Lee UNA página del delta ODP con reintento selectivo y la publica; deja __next o __delta en variables">
+        <until-successful maxRetries="${retry.maxRetries}" millisBetweenRetries="${retry.millisBetweenRetries}"
+            doc:name="Retry SAP Gateway" doc:description="Reintenta timeouts, 429 y 5xx del Gateway; los 4xx se propagan sin reintentar">
+            <try doc:name="GET página" doc:description="Clasifica errores del Gateway en transitorios y permanentes">
+                <http:request config-ref="SAP_Gateway_Config" method="GET" url="#[vars.nextUrl]"
+                    doc:name="GET delta ODP" doc:description="Lee una página del delta ODP (máx. 1,000 filas) con seguimiento de cambios">
+                    <http:headers><![CDATA[#[{
+                        "Accept": "application/json",
+                        "Prefer": "odata.track-changes, odata.maxpagesize=" ++ p("sap.gateway.pageSize")
+                    }]]]></http:headers>
+                </http:request>
+                <error-handler>
+                    <on-error-propagate type="HTTP:TIMEOUT, HTTP:CONNECTIVITY, HTTP:SERVICE_UNAVAILABLE, HTTP:TOO_MANY_REQUESTS, HTTP:BAD_GATEWAY, HTTP:GATEWAY_TIMEOUT, HTTP:INTERNAL_SERVER_ERROR"
+                        doc:name="Transitorio" doc:description="Se propaga para que until-successful reintente"/>
+                    <on-error-continue type="ANY" doc:name="Permanente" doc:description="4xx (autorización, servicio inexistente): marcar y salir del retry">
+                        <set-variable variableName="fatalError" value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]"
+                            doc:name="Marcar fatal" doc:description="Guarda la causa para detener la extracción de esta suscripción"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </until-successful>
+
+        <choice doc:name="¿Error permanente?" doc:description="Un 4xx detiene la suscripción sin avanzar el token">
+            <when expression="#[vars.fatalError != null]" doc:name="Sí" doc:description="El Gateway rechazó la petición de forma permanente">
+                <raise-error type="APP:SAP_GATEWAY_REJECTED" description="SAP Gateway rechazó la extracción ODP (error 4xx no reintentable)"
+                    doc:name="Raise SAP_GATEWAY_REJECTED" doc:description="Detiene la suscripción; el delta token queda sin avanzar"/>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Página → sobres CDC" doc:description="Mapea filas ODP (ODQ_CHANGEMODE C/U/D) a sobres CDC I/U/D con su llave SAP">
+            <ee:message>
+                <ee:set-payload resource="dw/odp-page-to-cdc.dwl"/>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="nextUrl"><![CDATA[%dw 2.0
+output application/java
+---
+payload.d.'__next' default null]]></ee:set-variable>
+                <ee:set-variable variableName="pageDelta"><![CDATA[%dw 2.0
+output application/java
+---
+payload.d.'__delta' default null]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <foreach doc:name="Publicar filas" doc:description="Publica cada sobre CDC en la cola del dominio con propiedades de trazabilidad">
+            <anypoint-mq:publish config-ref="Anypoint_MQ_Config" destination="#[p('amq.queue.' ++ vars.domain)]" messageId="#[payload.cdcId]"
+                doc:name="Publicar en MQ" doc:description="Publica el sobre CDC; messageId = cdcId para trazabilidad en Anypoint MQ">
+                <anypoint-mq:body><![CDATA[#[output application/json --- payload]]]></anypoint-mq:body>
+                <anypoint-mq:properties><![CDATA[#[%dw 2.0 import * from dw::cdc::Envelope output application/java --- mqProperties(payload)]]]></anypoint-mq:properties>
+            </anypoint-mq:publish>
+        </foreach>
+
+        <ee:transform doc:name="Contadores" doc:description="Acumula páginas y registros publicados; guarda __delta si es la última página">
+            <ee:variables>
+                <ee:set-variable variableName="pages"><![CDATA[%dw 2.0
+output application/java
+---
+vars.pages + 1]]></ee:set-variable>
+                <ee:set-variable variableName="published"><![CDATA[%dw 2.0
+output application/java
+---
+vars.published + sizeOf(payload)]]></ee:set-variable>
+                <ee:set-variable variableName="seqBase"><![CDATA[%dw 2.0
+output application/java
+---
+vars.seqBase + sizeOf(payload)]]></ee:set-variable>
+                <ee:set-variable variableName="newDelta"><![CDATA[%dw 2.0
+output application/java
+---
+if (vars.nextUrl == null) vars.pageDelta else null]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+    </flow>
+
+</mule>

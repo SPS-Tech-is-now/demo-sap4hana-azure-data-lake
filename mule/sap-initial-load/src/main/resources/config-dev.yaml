@@ -1,0 +1,26 @@
+# sap-initial-load — configuración entorno DEV (Artes Gráficas)
+sap:
+  systemId: "ECC_PRD"
+  host: "sapecc.artesgraficas.local"
+  systemNumber: "00"
+  client: "300"
+
+load:
+  cron: "0 0 22 ? * MON-FRI"          # ventana nocturna; fines de semana: ampliar con otro cron
+  t0: "2026-11-02T22:00:00Z"          # marca T0: CDC activado antes de iniciar la carga
+  maxConcurrency: "4"                 # límite de llamadas RFC concurrentes hacia SAP
+  pageSize: "5000"
+  maxPages: "100000"                # tope de seguridad del bucle de paginación
+
+amq:
+  url: "https://mq-us-east-1.anypoint.mulesoft.com/api/v1"
+  queue:
+    audit:    "cdc.audit"
+    resync:   "cdc.cmd.resync"
+    maestros: "cdc.q.maestros"
+    ventas:   "cdc.q.ventas"
+    finanzas: "cdc.q.finanzas"
+
+retry:
+  maxRetries: "3"
+  millisBetweenRetries: "10000"

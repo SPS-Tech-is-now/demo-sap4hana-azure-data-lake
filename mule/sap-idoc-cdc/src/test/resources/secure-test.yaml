@@ -1,0 +1,7 @@
+# Valores cifrados con el Secure Properties Tool (AES/CBC) usando -Dmule.key.
+sap:
+  user: "test-dummy"
+  password: "test-dummy"
+amq:
+  clientId: "test-dummy"
+  clientSecret: "test-dummy"
